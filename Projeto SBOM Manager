@@ -1,0 +1,28 @@
+Projeto SBOM Manager
+
+-> Container Syft para gerar SBOM de RootFS
+-> Container Grymp, para scan de Vulnerabilidade em SBOM
+-> Container postgress para a base de dados da aplicacao
+-> Container Neo4J para armazenar os SBOM em si
+-> Container da aplicacao em si, construida em python Django (Matrix - SBOM Manager)
+
+
+Matrix - funcionalidades
+-> Login e senha
+-> Associacao de perfil a grupos (BUs)
+-> Permissionamento via RBAC
+-> Upload de RootFS
+-> Cada RootFS quando feito o upload, antes de ser escaneado, 
+deve estar associado a uma BU, dentro da BU existem varias familias, dentro das familias existem produtos
+
+-> depois de finalizado o scan das dependencias do rootFS, devem ser escaneadas as vulnerabilidades
+-> deve haver uma tela com visao de listas com opcao de mudar para visao de grafos dos SBOM
+-> Na mesma tela de lista, quando clicado na dependencias, deve abrir abaixo uma opcao descrevendo as vulnerabilidades da dependencia e algum as descricoes da vulnerabilidades
+-> quando for visao de grafo, e clicado na dependencia, deve abrir uma janela com descricao da vulnerabilidade
+
+
+
+
+=====================================Gerado po IA =======================================
+
+

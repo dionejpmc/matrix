@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login | Matrix SBOM Manager</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-900 flex items-center justify-center min-h-screen">
+
+    <div class="w-full max-w-md p-8 space-y-6 bg-slate-800 rounded-xl shadow-2xl border border-slate-700">
+        <div class="text-center">
+            <h1 class="text-3xl font-bold text-white tracking-tight">MATRIX</h1>
+            <p class="text-slate-400 mt-2">SBOM Manager</p>
+        </div>
+
+        {% if form.errors %}
+        <div class="p-3 text-sm text-red-400 bg-red-900/30 border border-red-800 rounded-lg">
+            Usuário ou senha incorretos. Tente novamente.
+        </div>
+        {% endif %}
+
+        <form method="post" class="space-y-4">
+            {% csrf_token %}
+            
+            <div>
+                <label for="id_username" class="block text-sm font-medium text-slate-300">Usuário</label>
+                <input type="text" name="username" id="id_username" required
+                    class="w-full px-4 py-2 mt-1 bg-slate-700 border border-slate-600 text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition">
+            </div>
+
+            <div>
+                <label for="id_password" class="block text-sm font-medium text-slate-300">Senha</label>
+                <input type="password" name="password" id="id_password" required
+                    class="w-full px-4 py-2 mt-1 bg-slate-700 border border-slate-600 text-white rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition">
+            </div>
+
+            <button type="submit" 
+                class="w-full py-3 mt-4 font-semibold text-white bg-blue-600 rounded-lg hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 focus:ring-offset-slate-800 transition shadow-lg shadow-blue-900/20">
+                Acessar Plataforma
+            </button>
+        </form>
+
+        <div class="pt-6 text-center border-t border-slate-700">
+            <p class="text-xs text-slate-500 uppercase tracking-widest">
+                Tela de Login
+            </p>
+        </div>
+    </div>
+
+</body>
+</html>

@@ -1,0 +1,96 @@
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: matrix-db
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - matrix_net
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: matrix-graph
+    environment:
+      - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - matrix_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: matrix-redis
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    networks:
+      - matrix_net
+
+  app:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    container_name: matrix-app
+    volumes:
+      - ./app:/app             # O manage.py local (./app/manage.py) vira /app/manage.py no container
+      - ./scripts:/scripts     # Garante que o entrypoint.sh esteja acessível
+      - rootfs_storage:/rootfs
+    working_dir: /app          # CRITICAL: Define onde o python deve procurar o manage.py
+    env_file: .env
+    ports:
+      - "8000:8000"
+    command: python manage.py runserver 0.0.0.0:8000
+    depends_on:
+      - db
+      - neo4j
+      - redis
+    networks:
+      - matrix_net
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+    container_name: matrix-worker
+    command: celery -A config worker --loglevel=info
+    volumes:
+      - ./app:/app
+      - rootfs_storage:/rootfs
+    env_file: .env
+    depends_on:
+      - redis
+    networks:
+      - matrix_net
+
+  syft:
+    build:
+      context: .
+      dockerfile: docker/syft/Dockerfile
+    container_name: matrix-syft
+    tty: true  # Mantém o processo aberto
+    volumes:
+      - rootfs_storage:/rootfs
+    networks:
+      - matrix_net
+
+  grype:
+    build:
+      context: .
+      dockerfile: docker/grype/Dockerfile
+    container_name: matrix-grype
+    tty: true  # Mantém o processo aberto
+    volumes:
+      - rootfs_storage:/rootfs
+    networks:
+      - matrix_net
+
+networks:
+  matrix_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  rootfs_storage:
