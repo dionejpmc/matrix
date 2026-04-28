@@ -79,20 +79,20 @@ O sistema é composto por **7 containers Docker** orquestrados via Docker Compos
 
 ```
                         ┌──────────────────────────────┐
-                        │         matrix_net            │
-                        │   (rede interna isolada)      │
+                        │         matrix_net           │
+                        │   (rede interna isolada)     │
                         │                              │
-   Usuário ──HTTPS──► ┌─┴──────────┐                  │
-                       │ matrix-app │◄──────────────────┤
-                       │  Django 5  │                   │
-                       └─┬──────────┘                  │
+   Usuário ──HTTPS──►   ┌───────────┐                  │
+                        │ matrix-app│◄─────────────────┤
+                        │  Django 5 │                  │
+                        └┬──────────┘                  │
                          │                             │
               ┌──────────┼──────────┬──────────┐       │
               ▼          ▼          ▼          ▼       │
-        ┌──────────┐ ┌───────┐ ┌────────┐ ┌────────┐  │
-        │matrix-db │ │neo4j  │ │ redis  │ │ worker │  │
-        │Postgres15│ │  5    │ │   7    │ │Celery  │  │
-        └──────────┘ └───────┘ └────────┘ └───┬────┘  │
+        ┌──────────┐ ┌───────┐ ┌────────┐ ┌────────┐   │
+        │matrix-db │ │neo4j  │ │ redis  │ │ worker │   │
+        │Postgres15│ │  5    │ │   7    │ │Celery  │   │
+        └──────────┘ └───────┘ └────────┘ └───┬────┘   │
                                                │       │
                                     ┌──────────┴──┐    │
                                     │  /rootfs    │    │
@@ -102,8 +102,8 @@ O sistema é composto por **7 containers Docker** orquestrados via Docker Compos
                                   ┌───────┐ ┌───────┐  │
                                   │ syft  │ │ grype │  │
                                   └───────┘ └───────┘  │
-                                                        │
-                        └──────────────────────────────┘
+                                                       │
+                                  └────────────────────┘
 ```
 
 | Container | Imagem | Função |
@@ -328,17 +328,6 @@ Em qualquer falha → [ERROR] com mensagem em ScanLog
 
 ## RBAC — Controle de Acesso
 
-Cada usuário pode ter papéis distintos em BUs diferentes.
-
-| Ação | Admin | Sec. Analyst | BU Manager | Contributor | Viewer |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Criar/editar BU | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Criar Família/Produto | ✅ | ❌ | ✅ (sua BU) | ❌ | ❌ |
-| Upload de RootFS | ✅ | ❌ | ✅ | ✅ (sua BU) | ❌ |
-| Ver SBOMs e CVEs | ✅ | ✅ (todas) | ✅ (sua BU) | ✅ (sua BU) | ✅ (sua BU) |
-| Triagem de CVE | ✅ | ✅ | ✅ (sua BU) | ❌ | ❌ |
-| Gerenciar usuários | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Exportar relatórios | ✅ | ✅ | ✅ (sua BU) | ❌ | ❌ |
 
 > A verificação de BU é sempre feita **server-side** via `BUAccessMixin`. IDs de BU enviados pelo cliente nunca são confiados sem validação.
 
