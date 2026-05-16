@@ -18,6 +18,9 @@ services:
       - NEO4J_AUTH=${NEO4J_USER}/${NEO4J_PASSWORD}
     volumes:
       - neo4j_data:/data
+      - ./uploads:/data/uploads
+    ports:
+      - "7474:7474"
     networks:
       - matrix_net
 
@@ -37,6 +40,7 @@ services:
       - ./app:/app             # O manage.py local (./app/manage.py) vira /app/manage.py no container
       - ./scripts:/scripts     # Garante que o entrypoint.sh esteja acessível
       - rootfs_storage:/rootfs
+      - ./uploads:/data/uploads
     working_dir: /app          # CRITICAL: Define onde o python deve procurar o manage.py
     env_file: .env
     ports:
@@ -53,16 +57,26 @@ services:
     build:
       context: .
       dockerfile: docker/app/Dockerfile
+    environment:
+      - PYTHONPATH=/app
+      - DJANGO_SETTINGS_MODULE=config.settings
     container_name: matrix-worker
-    command: celery -A config worker --loglevel=info
+    command: celery -A core worker --loglevel=info
     volumes:
       - ./app:/app
       - rootfs_storage:/rootfs
+      - ./uploads:/data/uploads
     env_file: .env
     depends_on:
       - redis
     networks:
       - matrix_net
+    cap_add:
+      - SYS_ADMIN
+    devices:
+      - /dev/loop-control:/dev/loop-control
+    security_opt:
+      - apparmor:unconfined
 
   syft:
     build:
@@ -72,6 +86,7 @@ services:
     tty: true  # Mantém o processo aberto
     volumes:
       - rootfs_storage:/rootfs
+      - ./uploads:/data/uploads
     networks:
       - matrix_net
 
@@ -83,6 +98,7 @@ services:
     tty: true  # Mantém o processo aberto
     volumes:
       - rootfs_storage:/rootfs
+      - ./uploads:/data/uploads
     networks:
       - matrix_net
 

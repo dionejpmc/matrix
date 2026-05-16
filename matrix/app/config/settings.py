@@ -13,6 +13,7 @@ https://docs.djangoproject.com/en/5.0/ref/settings/
 import environ
 import os
 from pathlib import Path
+from apps import * 
 
 env = environ.Env(DEBUG=(bool, False))
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -24,6 +25,26 @@ SECRET_KEY = env('SECRET_KEY')
 DEBUG = env('DEBUG')
 ALLOWED_HOSTS = ['*'] # Para desenvolvimento local
 
+# Aumenta o limite para 100MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 104857600 
+FILE_UPLOAD_MAX_MEMORY_SIZE = 104857600
+
+
+
+# Onde o Django vai salvar os arquivos dentro do container
+#MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+MEDIA_ROOT = '/data/uploads'
+# A URL para acessar esses arquivos via navegador
+MEDIA_URL = '/media/'
+
+CSRF_TRUSTED_ORIGINS = [
+    "https://localhost:8000",
+    "http://localhost:8000",
+    "https://localhost",
+    "http://localhost",
+    "https://cuddly-pancake-j99jw657qj35vwx-8000.app.github.dev",
+    "http://cuddly-pancake-j99jw657qj35vwx-8000.app.github.dev",
+]
 
 # Application definition
 
@@ -35,6 +56,13 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'usuarios',
+    'apps.vulnerabilities',
+    'apps.organizations',
+    'apps.rootfs',
+    'apps.sbom',
+    'apps.accounts.apps.AccountsConfig',
+    'apps.hbom',
+
 ]
 
 MIDDLEWARE = [
@@ -74,7 +102,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'config.wsgi.application'
 
-
+LOGOUT_REDIRECT_URL = '/accounts/login'
 # Database
 # https://docs.djangoproject.com/en/5.0/ref/settings/#databases
 
@@ -135,8 +163,6 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'staticfiles')
 # Redireciona o usuário para a página inicial (ou dashboard) após o login
 LOGIN_REDIRECT_URL = '/'  # Você também pode usar o nome de uma rota aqui, ex: 'home'
 
-# Redireciona o usuário de volta para a tela de login após fazer o logout
-LOGOUT_REDIRECT_URL = '/login/'
 
 # extras path
 STATICFILES_DIRS = [
@@ -147,6 +173,12 @@ STATICFILES_DIRS = [
 # https://docs.djangoproject.com/en/5.0/ref/settings/#default-auto-field
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+
+# USAR SOMENTE DE DESENVOLVIMETO, EXCLUIR EM PRODUÇÃO
+# Em desenvolvimento, isso ajuda a evitar conflitos de token
+CSRF_COOKIE_SAMESITE = 'Lax'
+SESSION_COOKIE_SAMESITE = 'Lax'
 
 PASSWORD_HASHERS = [
     'django.contrib.auth.hashers.Argon2PasswordHasher',

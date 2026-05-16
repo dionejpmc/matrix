@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="csrf-token" content="{{ csrf_token }}">
     <title>Matrix SBOM Manager | Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
@@ -11,57 +12,546 @@
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
         .animate-blink { animation: blink 1s infinite; }
         [x-cloak] { display: none !important; }
+        
+        /* Estilização da barra de rolagem para manter o clima futurista */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: #0f172a; }
+        ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 10px; }
+        ::-webkit-scrollbar-thumb:hover { background: #3b82f6; }
     </style>
 </head>
-<body class="bg-slate-900 text-slate-200 font-sans" x-data="{ profileOpen: false, selectedSbom: null }">
+<body class="bg-slate-900 text-slate-200 font-sans" 
+      x-data="{ 
+        profileOpen: false, 
+        selectedSbom: null,
+        uploadModal: { 
+            open: false, 
+            title: '', 
+            type: '', 
+            progress: 0, 
+            fileName: '', 
+            status: 'idle', 
+            error: '' 
+        },
+        depsModal: {
+            open: false,
+            productId: null,
+            productName: '',
+            components: [],
+            page: 1,
+            pageSize: 50,
+            total: 0,
+            loading: false,
+            search: '',
+            severityFilter: '',
+            get totalPages() { return Math.ceil(this.total / this.pageSize); },
+            get paginated() {
+                let filtered = this.components;
+                if (this.search) {
+                    const q = this.search.toLowerCase();
+                    filtered = filtered.filter(c =>
+                        c.name.toLowerCase().includes(q) ||
+                        (c.purl || '').toLowerCase().includes(q) ||
+                        (c.version || '').toLowerCase().includes(q)
+                    );
+                }
+                if (this.severityFilter) {
+                    const sev = this.severityFilter;
+                    filtered = filtered.filter(c =>
+                        c.vulnerabilities.some(v => v.severity === sev)
+                    );
+                }
+                this.total = filtered.length;
+                const start = (this.page - 1) * this.pageSize;
+                return filtered.slice(start, start + this.pageSize);
+            }
+        },
+        buStats: { sboms: '—', total_vulns: '—', resolved_vulns: '—', loading: true },
 
+        async loadBuStats() {
+            try {
+                const res = await fetch('/sbom/api/bu-stats/');
+                const data = await res.json();
+                this.buStats = { ...data, loading: false };
+            } catch(e) {
+                this.buStats = { sboms: '!', total_vulns: '!', resolved_vulns: '!', loading: false };
+            }
+        },
+
+        vulnDetail: null,
+        openVulnDetail(vuln) { this.vulnDetail = vuln; },
+
+        mitigationDetail: null,
+        async openMitigationDetail(mit) {
+            // Mostra dados básicos imediatamente
+            this.mitigationDetail = {
+                mitigation_id: mit.mitigation_id,
+                mitigation_name: mit.mitigation_name,
+                status: mit.status,
+                notes: mit.notes,
+                description: null,
+                references: null,
+                iec_62443: null,
+                loading: true,
+            };
+            // Busca descrição completa do JSON EMB3D via API
+            try {
+                const res = await fetch(`/hbom/emb3d/mitigations/${mit.mitigation_id}/`);
+                const data = await res.json();
+                this.mitigationDetail = {
+                    ...this.mitigationDetail,
+                    description: data.description || 'Sem descrição disponível.',
+                    references: data.references || '',
+                    iec_62443: data.iec_62443 || '',
+                    loading: false,
+                };
+            } catch(e) {
+                this.mitigationDetail.loading = false;
+                this.mitigationDetail.description = 'Erro ao carregar detalhes.';
+            }
+        },
+
+        hbomModal: {
+            open: false,
+            sbomId: null,
+            hbomId: null,
+            productName: '',
+            components: [],
+            componentTypes: [],
+            interfaceChoices: [],
+            loading: false,
+            saving: false,
+            showForm: false,
+            editingId: null,
+            selectedComponent: null,
+            form: {
+                name: '', manufacturer: '', type: 'OTHER', version: '',
+                interfaces: [], secure_boot: false, firmware_signed: false,
+                encrypted_storage: false, debug_ports_disabled: false, notes: ''
+            },
+            resetForm() {
+                this.form = {
+                    name: '', manufacturer: '', type: 'OTHER', version: '',
+                    interfaces: [], secure_boot: false, firmware_signed: false,
+                    encrypted_storage: false, debug_ports_disabled: false, notes: ''
+                };
+                this.editingId = null;
+                this.showForm = false;
+            },
+            toggleInterface(iface) {
+                const idx = this.form.interfaces.indexOf(iface);
+                if (idx >= 0) this.form.interfaces.splice(idx, 1);
+                else this.form.interfaces.push(iface);
+            },
+            get pendingMitigations() {
+                if (!this.selectedComponent) return 0;
+                let count = 0;
+                for (const t of (this.selectedComponent.threats || [])) {
+                    count += (t.mitigations || []).filter(m => m.status === 'PENDING').length;
+                }
+                return count;
+            }
+        },
+
+        async openHbomModal(sbomId, productName) {
+            this.hbomModal.open = true;
+            this.hbomModal.sbomId = sbomId;
+            this.hbomModal.productName = productName;
+            this.hbomModal.loading = true;
+            this.hbomModal.showForm = false;
+            this.hbomModal.components = [];
+            try {
+                const res = await fetch(`/hbom/sbom/${sbomId}/`);
+                const data = await res.json();
+                this.hbomModal.hbomId = data.hbom_id;
+                this.hbomModal.components = data.components || [];
+                this.hbomModal.componentTypes = data.component_types || [];
+                this.hbomModal.interfaceChoices = data.interface_choices || [];
+            } catch(e) {
+                console.error('Erro ao carregar HBOM:', e);
+            } finally {
+                this.hbomModal.loading = false;
+            }
+        },
+
+        async saveHbomComponent() {
+            this.hbomModal.saving = true;
+            const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+            try {
+                if (this.hbomModal.editingId) {
+                    // Update
+                    await fetch(`/hbom/components/${this.hbomModal.editingId}/update/`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+                        body: JSON.stringify(this.hbomModal.form)
+                    });
+                    const idx = this.hbomModal.components.findIndex(c => c.id === this.hbomModal.editingId);
+                    if (idx >= 0) this.hbomModal.components[idx] = { ...this.hbomModal.components[idx], ...this.hbomModal.form };
+                } else {
+                    // Create
+                    const res = await fetch(`/hbom/${this.hbomModal.hbomId}/components/`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+                        body: JSON.stringify(this.hbomModal.form)
+                    });
+                    const created = await res.json();
+                    this.hbomModal.components.push({ ...this.hbomModal.form, id: created.id });
+                }
+                this.hbomModal.resetForm();
+                // Seleciona o componente salvo no painel de detalhe
+                await this.reloadComponent(this.hbomModal.hbomId);
+            } catch(e) {
+                console.error('Erro ao salvar componente:', e);
+            } finally {
+                this.hbomModal.saving = false;
+            }
+        },
+
+        editHbomComponent(comp) {
+            this.hbomModal.editingId = comp.id;
+            this.hbomModal.form = {
+                name: comp.name, manufacturer: comp.manufacturer,
+                type: comp.type, version: comp.version,
+                interfaces: [...(comp.interfaces || [])],
+                secure_boot: comp.secure_boot, firmware_signed: comp.firmware_signed,
+                encrypted_storage: comp.encrypted_storage,
+                debug_ports_disabled: comp.debug_ports_disabled,
+                notes: comp.notes || ''
+            };
+            this.hbomModal.selectedComponent = null;
+            this.hbomModal.showForm = true;
+        },
+
+        async deleteHbomComponent(compId) {
+            const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+            await fetch(`/hbom/components/${compId}/`, {
+                method: 'DELETE',
+                headers: { 'X-CSRFToken': csrf }
+            });
+            this.hbomModal.components = this.hbomModal.components.filter(c => c.id !== compId);
+        },
+
+        // ── Modal de Ameaças EMB3D ──────────────────────────────
+        threatModal: {
+            open: false,
+            componentId: null,
+            componentName: '',
+            // Etapas: 'pids' | 'threats' | 'mitigations'
+            step: 'pids',
+            // PIDs
+            categories: {},
+            selectedPids: [],
+            // Threats sugeridas
+            suggestedThreats: [],
+            selectedThreats: [],
+            loadingThreats: false,
+            // Salvar
+            saving: false,
+        },
+
+        async openThreatModal(comp) {
+            this.threatModal.open = true;
+            this.threatModal.componentId = comp.id;
+            this.threatModal.componentName = comp.name;
+            this.threatModal.step = 'pids';
+            this.threatModal.selectedPids = [];
+            this.threatModal.selectedThreats = [];
+            this.threatModal.suggestedThreats = [];
+            this.threatModal.categories = {};
+            // Carrega PIDs do EMB3D
+            try {
+                const res = await fetch('/hbom/emb3d/properties/');
+                const data = await res.json();
+                this.threatModal.categories = data.categories || {};
+            } catch(e) { console.error(e); }
+        },
+
+        togglePid(pid) {
+            const idx = this.threatModal.selectedPids.indexOf(pid);
+            if (idx >= 0) this.threatModal.selectedPids.splice(idx, 1);
+            else this.threatModal.selectedPids.push(pid);
+        },
+
+        async fetchThreatsForPids() {
+            if (!this.threatModal.selectedPids.length) return;
+            this.threatModal.loadingThreats = true;
+            this.threatModal.step = 'threats';
+            try {
+                const params = this.threatModal.selectedPids.map(p => `pid=${p}`).join('&');
+                const res = await fetch(`/hbom/emb3d/threats/?${params}`);
+                const data = await res.json();
+                this.threatModal.suggestedThreats = data.threats || [];
+                // Pré-seleciona todas
+                this.threatModal.selectedThreats = this.threatModal.suggestedThreats.map(t => t.tid);
+            } catch(e) { console.error(e); }
+            finally { this.threatModal.loadingThreats = false; }
+        },
+
+        async saveThreats() {
+            this.threatModal.saving = true;
+            const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+            const threats = this.threatModal.suggestedThreats.filter(
+                t => this.threatModal.selectedThreats.includes(t.tid)
+            );
+            try {
+                await fetch(`/hbom/components/${this.threatModal.componentId}/threats/`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+                    body: JSON.stringify({
+                        pids: this.threatModal.selectedPids,
+                        threats: threats.map(t => ({ tid: t.tid, name: t.name }))
+                    })
+                });
+                // Recarrega o componente na lista para mostrar threats
+                await this.reloadComponent(this.threatModal.componentId);
+                this.threatModal.open = false;
+            } catch(e) { console.error(e); }
+            finally { this.threatModal.saving = false; }
+        },
+
+        async reloadComponent(compId) {
+            const res = await fetch(`/hbom/sbom/${this.hbomModal.sbomId}/`);
+            const data = await res.json();
+            this.hbomModal.components = data.components || [];
+            // Mantém o componente selecionado atualizado
+            if (this.hbomModal.selectedComponent) {
+                this.hbomModal.selectedComponent = this.hbomModal.components.find(
+                    c => c.id === this.hbomModal.selectedComponent.id
+                ) || null;
+            }
+        },
+
+        async updateMitigationStatus(mitId, status) {
+            const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+            await fetch(`/hbom/mitigations/${mitId}/`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json', 'X-CSRFToken': csrf },
+                body: JSON.stringify({ status })
+            });
+            // Atualiza localmente
+            for (const comp of this.hbomModal.components) {
+                for (const threat of (comp.threats || [])) {
+                    for (const mit of (threat.mitigations || [])) {
+                        if (mit.id === mitId) { mit.status = status; }
+                    }
+                }
+            }
+        },
+
+        async removeComponentThreat(threatId, compId) {
+            const csrf = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+            await fetch(`/hbom/threats/${threatId}/`, {
+                method: 'DELETE',
+                headers: { 'X-CSRFToken': csrf }
+            });
+            const comp = this.hbomModal.components.find(c => c.id === compId);
+            if (comp) comp.threats = comp.threats.filter(t => t.id !== threatId);
+        },
+
+        async openDepsModal(productId, productName) {
+            this.depsModal.open = true;
+            this.depsModal.productId = productId;
+            this.depsModal.productName = productName;
+            this.depsModal.page = 1;
+            this.depsModal.search = '';
+            this.depsModal.loading = true;
+            this.depsModal.components = [];
+            try {
+                const res = await fetch(`/sbom/api/components/${productId}/`);
+                const data = await res.json();
+                this.depsModal.components = data.components || [];
+                this.depsModal.total = this.depsModal.components.length;
+            } catch(e) {
+                this.depsModal.components = [];
+            } finally {
+                this.depsModal.loading = false;
+            }
+        },
+
+        // FUNÇÃO CORRIGIDA E COM DEBUGS
+        async handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const type = this.uploadModal.type;
+            const CHUNK_SIZE = 1024 * 1024 * 5; // 2MB por pedaço
+            const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+            const uploadId = crypto.randomUUID(); // Identificador único para este upload
+            const fileName = file.name;
+
+            this.uploadModal.status = 'uploading';
+            this.uploadModal.fileName = fileName;
+
+            const csrfToken = document.querySelector('[name=csrfmiddlewaretoken]')?.value || '';
+
+            for (let i = 0; i < totalChunks; i++) {
+                const start = i * CHUNK_SIZE;
+                const end = Math.min(file.size, start + CHUNK_SIZE);
+                const chunk = file.slice(start, end);
+
+                const formData = new FormData();
+                formData.append('file', chunk); // O Django espera 'file' ou 'sbom_file'
+                formData.append('upload_id', uploadId);
+                formData.append('chunk_index', i);
+                formData.append('total_chunks', totalChunks);
+                formData.append('filename', fileName);
+                formData.append('type', type);
+                formData.append('product_name', this.uploadModal.productName);
+                formData.append('product_version', this.uploadModal.productVersion);
+
+                try {
+                    const response = await fetch('upload/', {
+                        method: 'POST',
+                        body: formData,
+                        credentials: 'include',
+                        headers: { 'X-CSRFToken': csrfToken }
+                    });
+
+                    if (!response.ok) throw new Error('Falha no envio do pedaço ' + i);
+
+                    // Atualiza progresso visual
+                    this.uploadModal.progress = Math.round(((i + 1) / totalChunks) * 100);
+                    
+                } catch (err) {
+                    this.uploadModal.error = 'Erro: ' + err.message;
+                    this.uploadModal.status = 'idle';
+                    return;
+                }
+            }
+
+            this.uploadModal.status = 'success';
+    }
+}"
+x-init="loadBuStats()">
+<form method="POST" enctype="multipart/form-data" id="csrf-form" style="display:none">
+    {% csrf_token %}
+</form>
     <header class="h-20 border-b border-slate-800 bg-slate-900/80 backdrop-blur-xl flex items-center justify-between px-12 sticky top-0 z-40">
         <div class="flex items-center space-x-12">
             <div class="flex flex-col">
                 <h1 class="text-2xl font-black text-white tracking-tighter italic">MATRIX</h1>
-                <span cass="text-[9px] text-blue-500 font-mono tracking-[0.3em] uppercase">SBOM Monitor and Security Intelligence</span>
+                <span class="text-[9px] text-blue-500 font-mono tracking-[0.3em] uppercase">SBOM Monitor and Security Intelligence</span>
             </div>
         </div>
-
         <div class="flex items-center space-x-6">
             <div class="relative">
                 <button @click="profileOpen = !profileOpen" class="flex items-center group bg-slate-800 p-2 rounded-full border border-slate-700 hover:border-blue-500 transition">
                     <div class="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center text-white">
                         <i class="fas fa-user-shield text-xs"></i>
                     </div>
-                    <span class="mx-3 text-xs font-bold text-slate-300 group-hover:text-white">{{ user.username }}</span>
+                    {% if user.is_authenticated %}
+                        <span class="mx-3 text-xs font-bold text-slate-300 group-hover:text-white">Bem-vindo, {{ user.username }}</span>
+                        
+                    {% else %}
+                            <a href="{% url 'singup' %}">Entrar no Sistema</a>
+                    {% endif %}
                     <i class="fas fa-chevron-down text-[10px] text-slate-500 mr-2"></i>
                 </button>
 
-                <div x-show="profileOpen" x-cloak @click.away="profileOpen = false" class="absolute right-0 mt-4 w-64 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl py-4 z-50">
-                    <button class="w-full text-left px-6 py-3 text-sm hover:bg-slate-700 flex items-center"><i class="fas fa-sitemap mr-3 text-blue-500"></i> Gestão de BUs</button>
-                    <button class="w-full text-left px-6 py-3 text-sm hover:bg-slate-700 flex items-center"><i class="fas fa-users-gear mr-3 text-blue-500"></i> Usuários & Permissões</button>
+               <div x-show="profileOpen" x-cloak @click.away="profileOpen = false" class="absolute right-0 mt-4 w-64 bg-slate-800 border border-slate-700 rounded-2xl shadow-2xl py-4 z-50">
+                    <!-- Links de Gestão -->
+                    <button class="w-full text-left px-6 py-3 text-sm hover:bg-slate-700 flex items-center transition-colors">
+                        <i class="fas fa-sitemap mr-3 text-blue-500"></i> Gestão de BUs
+                    </button>
+                    
+                    <a href="{% url 'signup' %}" class="w-full text-left px-6 py-3 text-sm hover:bg-slate-700 flex items-center no-underline text-white transition-colors">
+                        <i class="fas fa-users-gear mr-3 text-blue-500"></i> Usuários & Permissões
+                    </a>
+
+                    <!-- Seção de Logout -->
                     <div class="border-t border-slate-700 mt-4 pt-4 px-4">
-                        <form action="{% url 'logout' %}" method="post">
+                        <form action="{% url 'logoff' %}" method="post">
                             {% csrf_token %}
-                            <button type="submit" class="w-full py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white text-xs font-bold rounded-lg transition">Encerrar Sessão</button>
+                            <button type="submit" class="w-full py-2 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white text-xs font-bold rounded-lg transition-all duration-200">
+                                Sair do Sistema
+                            </button>
                         </form>
                     </div>
                 </div>
             </div>
         </div>
     </header>
-
     <main class="max-w-7xl mx-auto py-12 px-6 space-y-12">
-        
-        <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
-            <div class="bg-slate-800/50 p-6 rounded-3xl border border-slate-800">
-                <p class="text-[10px] text-slate-500 font-black uppercase tracking-widest">SBOMs Monitorados</p>
-                <h3 class="text-4xl font-bold text-white mt-2">142</h3>
+        <!-- Stats da BU -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-5">
+
+            <!-- SBOMs Monitorados -->
+            <div class="relative bg-slate-900 border border-slate-800 rounded-3xl p-6 overflow-hidden group hover:border-blue-500/30 transition-all duration-300">
+                <div class="absolute inset-0 bg-blue-500/3 opacity-0 group-hover:opacity-100 transition-opacity duration-300 rounded-3xl"></div>
+                <div class="relative">
+                    <div class="flex items-start justify-between mb-4">
+                        <div class="w-10 h-10 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center">
+                            <i class="fas fa-shield-halved text-blue-400 text-sm"></i>
+                        </div>
+                        <span class="text-[9px] font-black uppercase tracking-widest text-blue-500/50 bg-blue-500/5 border border-blue-500/10 px-2 py-1 rounded-full">BU Atual</span>
+                    </div>
+                    <div x-show="buStats.loading" class="animate-pulse">
+                        <div class="h-10 bg-slate-800 rounded-xl w-24 mb-2"></div>
+                        <div class="h-3 bg-slate-800 rounded w-32"></div>
+                    </div>
+                    <div x-show="!buStats.loading">
+                        <p class="text-5xl font-black text-white tracking-tight" x-text="buStats.sboms"></p>
+                        <p class="text-[11px] text-slate-500 font-bold uppercase tracking-widest mt-2">SBOMs Monitorados</p>
+                    </div>
+                </div>
             </div>
-            <div class="bg-slate-800/50 p-6 rounded-3xl border border-slate-800 border-l-4 border-l-red-600">
-                <p class="text-[10px] text-red-500/50 font-black uppercase tracking-widest">Total Vulnerabilidades (BU)</p>
-                <h3 class="text-4xl font-bold text-white mt-2">2.845</h3>
+
+            <!-- Total Vulnerabilidades -->
+            <div class="relative bg-slate-900 border border-slate-800 rounded-3xl p-6 overflow-hidden group hover:border-red-500/30 transition-all duration-300">
+                <div class="absolute inset-0 bg-red-500/3 opacity-0 group-hover:opacity-100 transition-opacity duration-300 rounded-3xl"></div>
+                <!-- Glow decorativo -->
+                <div class="absolute -bottom-6 -right-6 w-24 h-24 bg-red-500/10 rounded-full blur-2xl"></div>
+                <div class="relative">
+                    <div class="flex items-start justify-between mb-4">
+                        <div class="w-10 h-10 rounded-2xl bg-red-500/10 border border-red-500/20 flex items-center justify-center">
+                            <i class="fas fa-bug text-red-400 text-sm"></i>
+                        </div>
+                        <span class="text-[9px] font-black uppercase tracking-widest text-red-500/50 bg-red-500/5 border border-red-500/10 px-2 py-1 rounded-full">Exposição</span>
+                    </div>
+                    <div x-show="buStats.loading" class="animate-pulse">
+                        <div class="h-10 bg-slate-800 rounded-xl w-28 mb-2"></div>
+                        <div class="h-3 bg-slate-800 rounded w-36"></div>
+                    </div>
+                    <div x-show="!buStats.loading">
+                        <p class="text-5xl font-black text-white tracking-tight"
+                           x-text="typeof buStats.total_vulns === 'number' ? buStats.total_vulns.toLocaleString('pt-BR') : '—'"></p>
+                        <p class="text-[11px] text-slate-500 font-bold uppercase tracking-widest mt-2">Total de Vulnerabilidades</p>
+                    </div>
+                </div>
             </div>
-            <div class="bg-slate-800/50 p-6 rounded-3xl border border-slate-800 border-l-4 border-l-green-600">
-                <p class="text-[10px] text-green-500/50 font-black uppercase tracking-widest">Corrigidas / Mitigadas (BU)</p>
-                <h3 class="text-4xl font-bold text-white mt-2">1.120</h3>
+
+            <!-- Corrigidas / Mitigadas -->
+            <div class="relative bg-slate-900 border border-slate-800 rounded-3xl p-6 overflow-hidden group hover:border-green-500/30 transition-all duration-300">
+                <div class="absolute inset-0 bg-green-500/3 opacity-0 group-hover:opacity-100 transition-opacity duration-300 rounded-3xl"></div>
+                <div class="absolute -bottom-6 -right-6 w-24 h-24 bg-green-500/10 rounded-full blur-2xl"></div>
+                <div class="relative">
+                    <div class="flex items-start justify-between mb-4">
+                        <div class="w-10 h-10 rounded-2xl bg-green-500/10 border border-green-500/20 flex items-center justify-center">
+                            <i class="fas fa-circle-check text-green-400 text-sm"></i>
+                        </div>
+                        <!-- Barra de progresso -->
+                        <div x-show="!buStats.loading && buStats.total_vulns > 0"
+                             class="flex items-center gap-2">
+                            <div class="w-16 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                                <div class="h-full bg-green-500 rounded-full transition-all duration-700"
+                                     :style="`width: ${Math.round((buStats.resolved_vulns / buStats.total_vulns) * 100)}%`"></div>
+                            </div>
+                            <span class="text-[9px] font-black text-green-400"
+                                  x-text="`${Math.round((buStats.resolved_vulns / buStats.total_vulns) * 100)}%`"></span>
+                        </div>
+                    </div>
+                    <div x-show="buStats.loading" class="animate-pulse">
+                        <div class="h-10 bg-slate-800 rounded-xl w-24 mb-2"></div>
+                        <div class="h-3 bg-slate-800 rounded w-32"></div>
+                    </div>
+                    <div x-show="!buStats.loading">
+                        <p class="text-5xl font-black text-white tracking-tight"
+                           x-text="typeof buStats.resolved_vulns === 'number' ? buStats.resolved_vulns.toLocaleString('pt-BR') : '—'"></p>
+                        <p class="text-[11px] text-slate-500 font-bold uppercase tracking-widest mt-2">Corrigidas / Mitigadas</p>
+                    </div>
+                </div>
             </div>
+
         </div>
 
         <div class="flex flex-col md:flex-row justify-between items-end gap-6">
@@ -69,49 +559,174 @@
                 <h2 class="text-2xl font-bold text-white tracking-tight">Inventário de Software</h2>
                 <p class="text-slate-500 text-sm mt-1">Gerencie componentes, analise riscos e execute scans de segurança.</p>
             </div>
+            
+
+
+            
             <div class="flex space-x-3 bg-slate-800 p-1.5 rounded-2xl border border-slate-700">
-                <button class="bg-slate-700 hover:bg-slate-600 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center">
+                <button @click="uploadModal = { open: true, title: 'Upload de SBOM', type: 'sbom', progress: 0, fileName: '', status: 'idle', error: '' }" 
+                        class="bg-slate-700 hover:bg-slate-600 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center">
                     <i class="fas fa-file-code mr-2 text-blue-400"></i> Scan de SBOM
                 </button>
-                <button class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center shadow-lg shadow-blue-900/40">
+                <button @click="uploadModal = { open: true, title: 'Upload de RootFS', type: 'rootfs', progress: 0, fileName: '', status: 'idle', error: '' }" 
+                        class="bg-blue-600 hover:bg-blue-500 text-white px-5 py-2.5 rounded-xl text-xs font-bold transition flex items-center shadow-lg shadow-blue-900/40">
                     <i class="fas fa-microchip mr-2"></i> Scan de RootFS
                 </button>
             </div>
         </div>
-
+        <p class="text-white">DEBUG: Quantidade de produtos: {{ products.count }}</p>
         <div class="bg-slate-800/30 rounded-[2rem] border border-slate-800 overflow-hidden shadow-2xl">
             <table class="w-full text-left border-collapse">
+                
                 <thead class="bg-slate-900/50 text-[10px] text-slate-500 uppercase tracking-widest font-black">
                     <tr>
                         <th class="px-10 py-6">Produto / Sistema</th>
                         <th class="px-10 py-6">Versão</th>
+                        <th class="px-10 py-6">Componentes</th>
+                        <th class="px-10 py-6">Responsável</th>
+                        <th class="px-10 py-6">Área de Negócio</th>
                         <th class="px-10 py-6">Status de Risco</th>
                     </tr>
                 </thead>
                 <tbody class="divide-y divide-slate-800">
-                    <tr @click="selectedSbom = {id: 1, name: 'Industrial-Gateway-A1', ver: 'v2.4.1'}" class="hover:bg-blue-600/5 cursor-pointer transition group">
+                    <!-- INÍCIO DO LOOP: O Django vai repetir isso para cada produto no banco -->
+                    {% for product in products %}
+                    <tr @click="selectedSbom = {id: {{ product.id }}, name: '{{ product.name }}', ver: '{{ product.version|default:"-" }}', sbomId: '{{ product.uploads.last.id|default:"" }}'}" 
+                        class="hover:bg-blue-600/5 cursor-pointer transition group">
+                        
                         <td class="px-10 py-6">
                             <div class="flex items-center">
-                                <span class="text-white font-bold group-hover:text-blue-400 transition">Industrial-Gateway-A1</span>
-                                <i class="fas fa-triangle-exclamation text-red-500 ml-4 animate-blink text-sm"></i>
+                                <span class="text-white font-bold group-hover:text-blue-400 transition">
+                                    {{ product.name }}
+                                </span>
+                                <!-- Ícone de alerta só aparece se for crítico (exemplo) -->
+                                {% if product.risk_level == 'CRITICAL' %}
+                                    <i class="fas fa-triangle-exclamation text-red-500 ml-4 animate-blink text-sm"></i>
+                                {% endif %}
                             </div>
                         </td>
-                        <td class="px-10 py-6 font-mono text-xs text-slate-500 italic">5.4.12</td>
+
+                        <td class="px-10 py-6 font-mono text-xs text-slate-500 italic">
+                            {{ product.version|default:"-" }}
+                        </td>
+                        <td class="px-10 py-6 font-mono text-xs text-slate-500 italic">
+                            {{ product.total_components }} itens
+                        </td>
+
+                        <td class="px-10 py-6 font-mono text-xs text-slate-500 italic">
+                            {{ product.created_by.first_name|default:"Sistema" }}
+                        </td>
+
+                        <td class="px-10 py-6 font-mono text-xs text-slate-500 italic">
+                            {{ product.business_unit.name|default:"Geral" }}
+                        </td>
+
                         <td class="px-10 py-6">
-                            <span class="px-4 py-1.5 bg-red-500/10 text-red-500 text-[10px] font-black rounded-full border border-red-500/20 uppercase">Crítico</span>
+                            <span class="px-4 py-1.5 bg-red-500/10 text-red-500 text-[10px] font-black rounded-full border border-red-500/20 uppercase">
+                                Crítico
+                            </span>
                         </td>
                     </tr>
+                    {% empty %}
+                    <!-- Caso não tenha nenhum produto no banco ainda -->
+                    <tr>
+                        <td colspan="5" class="px-10 py-10 text-center text-slate-500 italic text-sm">
+                            Nenhum produto encontrado para sua unidade de negócio.
+                        </td>
+                    </tr>
+                    {% endfor %}
+                    <!-- FIM DO LOOP -->
                 </tbody>
             </table>
         </div>
     </main>
 
+    <div x-show="uploadModal.open" x-cloak class="fixed inset-0 z-[110] flex items-center justify-center p-6">
+        <div @click="uploadModal.open = false" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md"></div>
+        
+        <div x-show="uploadModal.open" x-transition.scale.95 
+             class="relative w-full max-w-lg bg-slate-900 border border-slate-700 rounded-[2.5rem] p-8 shadow-2xl">
+            
+            <h3 class="text-xl font-bold text-white mb-2" x-text="uploadModal.title"></h3>
+            <p class="text-slate-500 text-xs mb-6 uppercase tracking-widest font-mono">Matrix Security Engine / File Validation</p>
+            <div class="space-y-3">
+                <input type="text"
+                    placeholder="Nome do Produto"
+                    x-model="uploadModal.productName"
+                    class="w-full bg-slate-800 border border-slate-700 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-blue-500">
+
+                <input type="text"
+                    placeholder="Versão do Produto"
+                    x-model="uploadModal.productVersion"
+                    class="w-full bg-slate-800 border border-slate-700 rounded-xl p-3 text-sm text-white focus:outline-none focus:border-blue-500">
+            </div>
+            <div class="space-y-4">
+                <input type="file" id="fileInput" class="hidden" @change="handleFileUpload($event)">
+                
+                <div @click="document.getElementById('fileInput').click()" 
+                     class="border-2 border-dashed border-slate-700 rounded-3xl p-10 flex flex-col items-center justify-center cursor-pointer hover:border-blue-500 hover:bg-blue-500/5 transition group">
+                    
+                    <template x-if="uploadModal.status === 'idle'">
+                        <div class="text-center">
+                            <div class="w-16 h-16 bg-slate-800 rounded-2xl flex items-center justify-center mb-4 mx-auto group-hover:text-blue-500 transition">
+                                <i class="fas fa-cloud-arrow-up text-2xl text-slate-500 group-hover:text-blue-500"></i>
+                            </div>
+                            <p class="text-sm font-bold text-slate-300">Selecione o arquivo para análise</p>
+                            <p class="text-[10px] text-slate-500 mt-2 font-mono" x-text="uploadModal.type === 'sbom' ? 'Suportado: .JSON' : 'Suportado: .TAR, .TAR.GZ'"></p>
+                        </div>
+                    </template>
+
+                    <template x-if="uploadModal.status === 'uploading' || uploadModal.status === 'success'">
+                        <div class="w-full">
+                            <div class="flex items-center justify-between mb-3">
+                                <div class="flex items-center space-x-3">
+                                    <i class="fas fa-file-alt text-blue-500"></i>
+                                    <span class="text-xs font-mono text-slate-300 truncate max-w-[200px]" x-text="uploadModal.fileName"></span>
+                                </div>
+                                <span class="text-xs font-black text-blue-500 font-mono" x-text="uploadModal.progress + '%'"></span>
+                            </div>
+                            
+                            <div class="w-full h-2 bg-slate-800 rounded-full overflow-hidden">
+                                <div class="h-full bg-blue-600 transition-all duration-300 shadow-[0_0_10px_#2563eb]" 
+                                     :style="`width: ${uploadModal.progress}%` text-white"></div>
+                            </div>
+
+                            <div class="mt-4 flex items-center justify-center space-x-2">
+                                <template x-if="uploadModal.status === 'uploading'">
+                                    <span class="flex items-center text-[10px] text-blue-400 uppercase tracking-widest animate-pulse font-bold">
+                                        <i class="fas fa-gear fa-spin mr-2"></i> Analisando Camadas...
+                                    </span>
+                                </template>
+                                <template x-if="uploadModal.status === 'success'">
+                                    <span class="flex items-center text-[10px] text-green-500 uppercase tracking-widest font-bold">
+                                        <i class="fas fa-check-double mr-2"></i> Pronto para Scan
+                                    </span>
+                                </template>
+                            </div>
+                        </div>
+                    </template>
+                </div>
+
+                <div x-show="uploadModal.error" x-transition class="bg-red-500/10 border border-red-500/20 p-4 rounded-2xl flex items-center">
+                    <i class="fas fa-triangle-exclamation text-red-500 mr-3"></i>
+                    <p class="text-xs text-red-500 font-bold" x-text="uploadModal.error"></p>
+                </div>
+
+                <div class="flex justify-end space-x-3 pt-4">
+                    <button @click="uploadModal.open = false" class="px-6 py-2 text-[10px] font-black text-slate-500 hover:text-white transition uppercase tracking-widest">Fechar</button>
+                    <button x-show="uploadModal.status === 'success'" @click="uploadModal.open = false" 
+                            class="bg-blue-600 hover:bg-blue-500 px-8 py-2.5 rounded-xl text-xs font-bold text-white uppercase shadow-lg shadow-blue-900/40 transition-all transform hover:scale-105">
+                        Iniciar Varredura
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <div x-show="selectedSbom" x-cloak class="fixed inset-0 z-[100] flex items-center justify-center p-6">
         <div @click="selectedSbom = null" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md transition-opacity"></div>
-        
         <div x-show="selectedSbom" x-transition.scale.95 
              class="relative w-full max-w-4xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl overflow-hidden">
-            
             <div class="flex flex-col md:flex-row h-full min-h-[550px]">
                 <div class="w-full md:w-1/3 bg-slate-800 p-10 border-r border-slate-700">
                     <div class="w-14 h-14 bg-blue-600/20 rounded-2xl flex items-center justify-center text-blue-500 text-xl mb-6 border border-blue-500/30">
@@ -119,7 +734,6 @@
                     </div>
                     <h3 class="text-2xl font-black text-white leading-tight uppercase tracking-tighter" x-text="selectedSbom?.name"></h3>
                     <p class="text-blue-400 font-mono text-[10px] mt-2 tracking-widest" x-text="selectedSbom?.ver"></p>
-                    
                     <div class="mt-10 p-4 bg-slate-900/50 rounded-2xl border border-slate-700">
                         <p class="text-[9px] text-slate-500 font-black uppercase">Vulnerabilidades</p>
                         <div class="flex items-center mt-2">
@@ -127,45 +741,47 @@
                             <span class="ml-2 text-[10px] text-red-500 font-bold bg-red-500/10 px-2 py-0.5 rounded italic">12 Críticas</span>
                         </div>
                     </div>
-
                     <button @click="selectedSbom = null" class="mt-12 text-slate-500 hover:text-white transition font-black text-[10px] uppercase tracking-widest flex items-center">
                         <i class="fas fa-chevron-left mr-2"></i> Voltar ao Inventário
                     </button>
                 </div>
-
-                <div class="flex-1 p-10 bg-slate-900">
+                <div class="flex-1 p-10 bg-slate-900 text-white">
                     <p class="text-[10px] text-slate-600 font-black uppercase tracking-[0.3em] mb-8 italic">Gestão de Vulnerabilidades & SBOM</p>
-                    
                     <div class="grid grid-cols-2 gap-4">
-                        <button class="group p-5 bg-slate-800 hover:bg-blue-600 rounded-3xl border border-slate-700 transition flex flex-col text-left">
+                        <button @click="openDepsModal(selectedSbom.id, selectedSbom.name)" class="group p-5 bg-slate-800 hover:bg-blue-600 rounded-3xl border border-slate-700 transition flex flex-col text-left text-white">
                             <i class="fas fa-edit text-blue-500 group-hover:text-white mb-3"></i>
-                            <span class="text-sm font-bold text-white">Editar Dependências</span>
+                            <span class="text-sm font-bold">Editar Dependências</span>
                             <span class="text-[9px] text-slate-500 group-hover:text-blue-100 mt-1 uppercase">Manutenção de PURLs</span>
                         </button>
-
-                        <button class="group p-5 bg-slate-800 hover:bg-orange-600 rounded-3xl border border-slate-700 transition flex flex-col text-left">
+                        <button class="group p-5 bg-slate-800 hover:bg-orange-600 rounded-3xl border border-slate-700 transition flex flex-col text-left text-white">
                             <i class="fas fa-mask text-orange-500 group-hover:text-white mb-3"></i>
-                            <span class="text-sm font-bold text-white">Falso Positivo</span>
+                            <span class="text-sm font-bold">Falso Positivo</span>
                             <span class="text-[9px] text-slate-500 group-hover:text-orange-100 mt-1 uppercase">Triagem Contextual</span>
                         </button>
-
-                        <button class="group p-5 bg-slate-800 hover:bg-purple-600 rounded-3xl border border-slate-700 transition flex flex-col text-left">
+                        <button 
+                            @click="loadGraph(selectedSbom.id)"
+                            class="group p-5 bg-slate-800 hover:bg-purple-600 rounded-3xl border border-slate-700 transition flex flex-col text-left text-white"
+                        >
                             <i class="fas fa-project-diagram text-purple-500 group-hover:text-white mb-3"></i>
-                            <span class="text-sm font-bold text-white">Explorar Grafo</span>
+                            <span class="text-sm font-bold">Explorar Grafo</span>
                             <span class="text-[9px] text-slate-500 group-hover:text-purple-100 mt-1 uppercase">Visualização Neo4j</span>
                         </button>
-
-                        <button class="group p-5 bg-slate-800 hover:bg-green-600 rounded-3xl border border-slate-700 transition flex flex-col text-left">
+                        <button class="group p-5 bg-slate-800 hover:bg-green-600 rounded-3xl border border-slate-700 transition flex flex-col text-left text-white">
                             <i class="fas fa-file-shield text-green-500 group-hover:text-white mb-3"></i>
-                            <span class="text-sm font-bold text-white">Carta de Risco</span>
+                            <span class="text-sm font-bold">Carta de Risco</span>
                             <span class="text-[9px] text-slate-500 group-hover:text-green-100 mt-1 uppercase">Relatório VEX</span>
                         </button>
-
-                        <button class="group p-5 bg-slate-800 hover:bg-red-600 rounded-3xl border border-slate-700 transition flex flex-col text-left border-dashed border-slate-600 col-span-2 mt-4">
+                        <button @click="selectedSbom.sbomId ? openHbomModal(selectedSbom.sbomId, selectedSbom.name) : alert('Este produto não possui SBOM vinculado.')""
+                                class="group p-5 bg-slate-800 hover:bg-cyan-600 rounded-3xl border border-slate-700 transition flex flex-col text-left text-white">
+                            <i class="fas fa-microchip text-cyan-500 group-hover:text-white mb-3"></i>
+                            <span class="text-sm font-bold">Gerenciar HBOM</span>
+                            <span class="text-[9px] text-slate-500 group-hover:text-cyan-100 mt-1 uppercase">Componentes de Hardware</span>
+                        </button>
+                        <button class="group p-5 bg-slate-800 hover:bg-red-600 rounded-3xl border border-slate-700 transition flex flex-col text-left border-dashed border-slate-600 col-span-2 mt-4 text-white">
                             <div class="flex items-center justify-between w-full">
-                                <div class="flex flex-col">
-                                    <span class="text-sm font-bold text-white group-hover:text-white">Remover SBOM do Monitoramento</span>
-                                    <span class="text-[9px] text-slate-500 group-hover:text-red-100 mt-1 uppercase tracking-widest">Ação Irreversível - Auditado via Logs</span>
+                                <div class="flex flex-col text-white">
+                                    <span class="text-sm font-bold">Remover SBOM do Monitoramento</span>
+                                    <span class="text-[9px] text-slate-500 group-hover:text-red-100 mt-1 uppercase tracking-widest">Ação Irreversível</span>
                                 </div>
                                 <i class="fas fa-trash-can text-slate-600 group-hover:text-white text-xl"></i>
                             </div>
@@ -176,5 +792,1416 @@
         </div>
     </div>
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<!-- Modal Fullscreen para o Grafo -->
+<div id="graph-modal" class="fixed inset-0 z-[100] hidden flex items-center justify-center p-4 md:p-10 animate-fade-in">
+    <!-- Backdrop com desfoque (Glassmorphism) -->
+    <div class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm" onclick="closeGraph()"></div>
+
+    <!-- Caixa do Grafo -->
+    <div class="relative w-full h-full bg-slate-900 rounded-[2.5rem] border border-slate-700 shadow-[0_0_100px_rgba(0,0,0,0.8)] flex flex-col overflow-hidden">
+        
+        <!-- Header do Modal -->
+        <div class="flex flex-col border-b border-slate-800 bg-slate-900/50">
+            <div class="flex items-center justify-between p-6 pb-4">
+                <div>
+                    <h3 class="text-xl text-white font-bold flex items-center">
+                        <i class="fas fa-project-diagram mr-3 text-purple-500"></i>
+                        Análise de Relacionamentos: <span id="modal-product-name" class="ml-2 text-purple-400"></span>
+                    </h3>
+                    <p class="text-[10px] text-slate-500 uppercase tracking-widest mt-1">Ambiente de Inspeção Neo4j · <span id="graph-node-count" class="text-slate-400"></span></p>
+                </div>
+                <button onclick="closeGraph()" class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all">
+                    <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+                </button>
+            </div>
+
+            <!-- Barra de filtros -->
+            <div class="flex items-center gap-3 px-6 pb-4 flex-wrap">
+                <!-- Filtros de severidade — clique já recarrega -->
+                <span class="text-[10px] text-slate-600 uppercase tracking-widest font-black shrink-0">Severidade:</span>
+                <div class="flex items-center gap-1 bg-slate-800 rounded-xl p-1 border border-slate-700 flex-wrap">
+                    <button onclick="setSeverityFilter('')"            id="filter-all"        class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase">Todas</button>
+                    <button onclick="setSeverityFilter('CRITICAL')"    id="filter-CRITICAL"   class="graph-filter-btn active px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-red-400">Critical</button>
+                    <button onclick="setSeverityFilter('HIGH')"        id="filter-HIGH"       class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-orange-400">High</button>
+                    <button onclick="setSeverityFilter('MEDIUM')"      id="filter-MEDIUM"     class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-yellow-400">Medium</button>
+                    <button onclick="setSeverityFilter('LOW')"         id="filter-LOW"        class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-blue-400">Low</button>
+                    <button onclick="setSeverityFilter('NEGLIGIBLE')"  id="filter-NEGLIGIBLE" class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-slate-400">Negligible</button>
+                    <button onclick="setSeverityFilter('UNKNOWN')"     id="filter-UNKNOWN"    class="graph-filter-btn px-3 py-1.5 rounded-lg text-[10px] font-black uppercase text-slate-500">Unknown</button>
+                </div>
+
+                <!-- Separador -->
+                <div class="w-px h-5 bg-slate-700 shrink-0"></div>
+
+                <!-- Busca por CVE -->
+                <span class="text-[10px] text-slate-600 uppercase tracking-widest font-black shrink-0">CVE:</span>
+                <div class="flex items-center gap-2">
+                    <div class="relative">
+                        <i class="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+                        <input id="cve-search-input" type="text" placeholder="ex: CVE-2022-1234"
+                               class="bg-slate-800 border border-slate-700 rounded-xl pl-9 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-purple-500 transition w-48 font-mono"
+                               onkeydown="if(event.key==='Enter') searchByCve()">
+                    </div>
+                    <button onclick="searchByCve()"
+                            class="px-3 py-2 bg-purple-600 hover:bg-purple-500 rounded-xl text-[10px] font-black text-white transition">
+                        Buscar
+                    </button>
+                </div>
+
+                <!-- Loading -->
+                <div id="graph-loading" class="hidden items-center gap-2 text-[10px] text-purple-400 font-mono animate-pulse ml-2">
+                    <i class="fas fa-gear fa-spin"></i> Carregando...
+                </div>
+            </div>
+        </div>
+
+        <!-- Área do Cytoscape -->
+        <div id="cy-fullscreen" class="flex-grow w-full h-full bg-[radial-gradient(#1e293b_1px,transparent_1px)] [background-size:20px_20px]"></div>
+
+        <!-- Legenda Flutuante -->
+        <div class="absolute bottom-6 left-6 bg-slate-950/90 p-4 rounded-2xl border border-slate-800 backdrop-blur-md pointer-events-none">
+            <div class="flex gap-6 items-center flex-wrap">
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-blue-500 rounded-full mr-2 shadow-[0_0_8px_#3b82f6]"></span> Produto</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-purple-500 rounded-full mr-2 shadow-[0_0_8px_#a855f7]"></span> Componente</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-red-600 rounded-full mr-2 shadow-[0_0_8px_#dc2626]"></span> CVE Critical</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-orange-500 rounded-full mr-2 shadow-[0_0_8px_#f97316]"></span> CVE High</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-yellow-500 rounded-full mr-2 shadow-[0_0_8px_#eab308]"></span> CVE Medium</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-blue-400 rounded-full mr-2"></span> CVE Low</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-slate-500 rounded-full mr-2"></span> Negligible</div>
+                <div class="flex items-center text-[10px] font-bold text-slate-400 uppercase"><span class="w-3 h-3 bg-slate-700 rounded-full mr-2 border border-slate-500"></span> Unknown</div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de Dependências / Editar Componentes -->
+<div x-show="depsModal.open" x-cloak class="fixed inset-0 z-[120] flex items-center justify-center p-4 md:p-8">
+    <div @click="depsModal.open = false" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md"></div>
+
+    <div x-show="depsModal.open" x-transition.scale.95
+         class="relative w-full max-w-6xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl flex flex-col overflow-hidden"
+         style="max-height: 90vh;">
+
+        <!-- Header -->
+        <div class="flex items-center justify-between px-8 py-6 border-b border-slate-800 bg-slate-900/80 shrink-0">
+            <div>
+                <h3 class="text-xl font-bold text-white flex items-center">
+                    <i class="fas fa-edit mr-3 text-blue-500"></i>
+                    Dependências:
+                    <span class="ml-2 text-blue-400" x-text="depsModal.productName"></span>
+                </h3>
+                <p class="text-[10px] text-slate-500 uppercase tracking-widest mt-1 font-mono">Manutenção de PURLs · <span x-text="depsModal.total"></span> componentes</p>
+            </div>
+            <button @click="depsModal.open = false" class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all">
+                <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+            </button>
+        </div>
+
+        <!-- Barra de busca + filtros + paginação -->
+        <div class="flex flex-col border-b border-slate-800 bg-slate-900/50 shrink-0">
+            <!-- Linha 1: busca + paginação -->
+            <div class="flex items-center justify-between px-8 py-3 gap-4 flex-wrap border-b border-slate-800/50">
+                <div class="relative flex-1 min-w-[200px] max-w-md">
+                    <i class="fas fa-search absolute left-4 top-1/2 -translate-y-1/2 text-slate-500 text-xs"></i>
+                    <input 
+                        type="text"
+                        x-model="depsModal.search"
+                        @input="depsModal.page = 1"
+                        placeholder="Filtrar por nome, versão ou PURL..."
+                        class="w-full bg-slate-800 border border-slate-700 rounded-xl pl-10 pr-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-blue-500 transition"
+                    >
+                </div>
+                <div class="flex items-center gap-3 text-xs font-mono text-slate-400 shrink-0">
+                    <span>Página <span class="text-white font-bold" x-text="depsModal.page"></span> de <span class="text-white font-bold" x-text="depsModal.totalPages || 1"></span></span>
+                    <button 
+                        @click="depsModal.page = Math.max(1, depsModal.page - 1)"
+                        :disabled="depsModal.page <= 1"
+                        class="px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                        <i class="fas fa-chevron-left text-[10px]"></i>
+                    </button>
+                    <button 
+                        @click="depsModal.page = Math.min(depsModal.totalPages, depsModal.page + 1)"
+                        :disabled="depsModal.page >= depsModal.totalPages"
+                        class="px-3 py-1.5 bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                        <i class="fas fa-chevron-right text-[10px]"></i>
+                    </button>
+                </div>
+            </div>
+            <!-- Linha 2: filtros de severidade -->
+            <div class="flex items-center gap-2 px-8 py-3 flex-wrap">
+                <span class="text-[10px] text-slate-600 uppercase tracking-widest font-black shrink-0">Severidade:</span>
+                <div class="flex items-center gap-1 bg-slate-800 rounded-xl p-1 border border-slate-700">
+                    <button @click="depsModal.severityFilter = ''; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition"
+                        :class="depsModal.severityFilter === '' ? 'bg-slate-600 text-white' : 'text-slate-400 hover:text-white'">
+                        Todas
+                    </button>
+                    <button @click="depsModal.severityFilter = 'CRITICAL'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-red-400"
+                        :class="depsModal.severityFilter === 'CRITICAL' ? 'bg-red-500/20 ring-1 ring-red-500/40' : 'opacity-50 hover:opacity-100'">
+                        Critical
+                    </button>
+                    <button @click="depsModal.severityFilter = 'HIGH'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-orange-400"
+                        :class="depsModal.severityFilter === 'HIGH' ? 'bg-orange-500/20 ring-1 ring-orange-500/40' : 'opacity-50 hover:opacity-100'">
+                        High
+                    </button>
+                    <button @click="depsModal.severityFilter = 'MEDIUM'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-yellow-400"
+                        :class="depsModal.severityFilter === 'MEDIUM' ? 'bg-yellow-500/20 ring-1 ring-yellow-500/40' : 'opacity-50 hover:opacity-100'">
+                        Medium
+                    </button>
+                    <button @click="depsModal.severityFilter = 'LOW'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-blue-400"
+                        :class="depsModal.severityFilter === 'LOW' ? 'bg-blue-500/20 ring-1 ring-blue-500/40' : 'opacity-50 hover:opacity-100'">
+                        Low
+                    </button>
+                    <button @click="depsModal.severityFilter = 'NEGLIGIBLE'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-slate-400"
+                        :class="depsModal.severityFilter === 'NEGLIGIBLE' ? 'bg-slate-600/40 ring-1 ring-slate-500/40' : 'opacity-50 hover:opacity-100'">
+                        Negligible
+                    </button>
+                    <button @click="depsModal.severityFilter = 'UNKNOWN'; depsModal.page = 1"
+                        class="px-3 py-1.5 rounded-lg text-[10px] font-black uppercase transition text-slate-500"
+                        :class="depsModal.severityFilter === 'UNKNOWN' ? 'bg-slate-700 ring-1 ring-slate-600' : 'opacity-50 hover:opacity-100'">
+                        Unknown
+                    </button>
+                </div>
+                <span class="text-[10px] text-slate-500 font-mono ml-2"
+                      x-show="depsModal.severityFilter"
+                      x-text="`Mostrando ${depsModal.total} componente(s) com vuln. ${depsModal.severityFilter}`">
+                </span>
+            </div>
+        </div>
+
+        <!-- Tabela -->
+        <div class="overflow-y-auto flex-1">
+            <!-- Loading -->
+            <div x-show="depsModal.loading" class="flex flex-col items-center justify-center py-20 text-slate-500">
+                <i class="fas fa-gear fa-spin text-2xl text-blue-500 mb-4"></i>
+                <span class="text-xs uppercase tracking-widest font-mono animate-pulse">Carregando componentes...</span>
+            </div>
+
+            <!-- Cabeçalho fixo -->
+            <div x-show="!depsModal.loading" class="grid grid-cols-[40px_2fr_1fr_1fr_2fr_1fr_160px_100px_32px] gap-0 bg-slate-900/90 border-b border-slate-800 sticky top-0 z-10 text-[10px] text-slate-500 uppercase tracking-widest font-black">
+                <div class="px-4 py-3 text-center">#</div>
+                <div class="px-4 py-3">Nome</div>
+                <div class="px-4 py-3">Versão</div>
+                <div class="px-4 py-3">Tipo</div>
+                <div class="px-4 py-3">PURL</div>
+                <div class="px-4 py-3">Licença</div>
+                <div class="px-4 py-3 text-center">Vulnerabilidades</div>
+                <div class="px-4 py-3 text-center">Produtos</div>
+                <div class="px-2 py-3"></div>
+            </div>
+
+            <!-- Linhas -->
+            <div x-show="!depsModal.loading">
+                <template x-for="(comp, idx) in depsModal.paginated" :key="comp.id">
+                    <div class="border-b border-slate-800">
+
+                        <!-- Linha principal -->
+                        <div @click="comp._expanded = !comp._expanded; if(!comp._products_count && comp._products_count !== 0) { fetch('/sbom/api/component-products/?name=' + encodeURIComponent(comp.name) + '&version=' + encodeURIComponent(comp.version)).then(r=>r.json()).then(d=>{ comp._products_count = d.count; }); }"
+                             class="grid grid-cols-[40px_2fr_1fr_1fr_2fr_1fr_160px_100px_32px] gap-0 hover:bg-slate-800/40 cursor-pointer transition items-center"
+                             :class="comp._expanded ? 'bg-slate-800/30' : ''">
+
+                            <div class="px-4 py-4 text-center text-[10px] text-slate-600 font-mono"
+                                 x-text="(depsModal.page - 1) * depsModal.pageSize + idx + 1"></div>
+
+                            <div class="px-4 py-4">
+                                <span class="text-white font-bold text-sm hover:text-blue-400 transition" x-text="comp.name"></span>
+                            </div>
+
+                            <div class="px-4 py-4">
+                                <span class="font-mono text-xs text-slate-400 bg-slate-800 px-2 py-1 rounded-lg" x-text="comp.version || '-'"></span>
+                            </div>
+
+                            <div class="px-4 py-4">
+                                <span class="text-[10px] font-black uppercase tracking-widest text-slate-500" x-text="comp.type || '-'"></span>
+                            </div>
+
+                            <div class="px-4 py-4 overflow-hidden">
+                                <span class="font-mono text-[10px] text-blue-400/70 truncate block" x-text="comp.purl || '-'" :title="comp.purl"></span>
+                            </div>
+
+                            <div class="px-4 py-4">
+                                <span class="text-[10px] font-bold px-2 py-1 rounded-full border"
+                                    :class="comp.license ? 'text-green-400 bg-green-500/10 border-green-500/20' : 'text-slate-600 bg-slate-800 border-slate-700'"
+                                    x-text="comp.license || 'N/A'">
+                                </span>
+                            </div>
+
+                            <!-- Badges severidade -->
+                            <div class="px-4 py-4 flex items-center justify-center gap-1 flex-wrap">
+                                <template x-if="comp.vuln_count === 0">
+                                    <span class="text-[10px] text-slate-600 font-mono">—</span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'CRITICAL').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-red-500/20 text-red-400 border border-red-500/30">
+                                        C:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'CRITICAL').length"></span>
+                                    </span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'HIGH').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-orange-500/20 text-orange-400 border border-orange-500/30">
+                                        H:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'HIGH').length"></span>
+                                    </span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'MEDIUM').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
+                                        M:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'MEDIUM').length"></span>
+                                    </span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'LOW').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-blue-500/20 text-blue-400 border border-blue-500/30">
+                                        L:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'LOW').length"></span>
+                                    </span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'NEGLIGIBLE').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-slate-700/50 text-slate-400 border border-slate-600">
+                                        N:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'NEGLIGIBLE').length"></span>
+                                    </span>
+                                </template>
+                                <template x-if="comp.vulnerabilities.filter(v => v.severity === 'UNKNOWN').length > 0">
+                                    <span class="px-2 py-0.5 rounded-full text-[9px] font-black bg-slate-800 text-slate-500 border border-slate-700">
+                                        ?:<span x-text="comp.vulnerabilities.filter(v => v.severity === 'UNKNOWN').length"></span>
+                                    </span>
+                                </template>
+                            </div>
+
+                            <!-- Produtos que usam este componente -->
+                            <div class="px-4 py-4 flex items-center justify-center">
+                                <span x-show="comp._products_count === undefined"
+                                      class="text-[10px] text-slate-600 font-mono">—</span>
+                                <span x-show="comp._products_count !== undefined"
+                                      class="text-[10px] font-black px-2 py-1 rounded-full border"
+                                      :class="comp._products_count > 1 ? 'text-orange-400 bg-orange-500/10 border-orange-500/20' : 'text-slate-500 bg-slate-800 border-slate-700'"
+                                      :title="comp._products_count + ' produto(s) usam este componente'"
+                                      x-text="comp._products_count"></span>
+                            </div>
+
+                            <!-- Chevron -->
+                            <div class="px-2 py-4 flex items-center justify-center">
+                                <i class="fas text-slate-500 text-xs transition-transform duration-200"
+                                   :class="comp._expanded ? 'fa-chevron-up text-blue-400' : 'fa-chevron-down'"
+                                   x-show="comp.vuln_count > 0"></i>
+                            </div>
+                        </div>
+
+                        <!-- Painel expansível de CVEs -->
+                        <div x-show="comp._expanded && comp.vuln_count > 0"
+                             class="bg-slate-950/60 border-t border-slate-800/60 px-10 py-4">
+                            <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">
+                                <i class="fas fa-bug mr-1 text-red-500"></i>
+                                Vulnerabilidades do componente
+                            </p>
+                            <div class="flex flex-col gap-2">
+                                <template x-for="vuln in comp.vulnerabilities" :key="vuln.cve_id">
+                                    <div @click.stop="openVulnDetail(vuln)"
+                                         class="flex items-center gap-4 bg-slate-900 hover:bg-slate-800 rounded-xl px-4 py-3 border border-slate-800 hover:border-slate-600 cursor-pointer transition group/vuln">
+                                        <span class="shrink-0 px-2 py-1 rounded-lg text-[9px] font-black uppercase w-16 text-center border"
+                                            :class="{
+                                                'bg-red-500/20 text-red-400 border-red-500/30': vuln.severity === 'CRITICAL',
+                                                'bg-orange-500/20 text-orange-400 border-orange-500/30': vuln.severity === 'HIGH',
+                                                'bg-yellow-500/20 text-yellow-400 border-yellow-500/30': vuln.severity === 'MEDIUM',
+                                                'bg-blue-500/20 text-blue-400 border-blue-500/30': vuln.severity === 'LOW',
+                                                'bg-slate-700/50 text-slate-400 border-slate-600': vuln.severity === 'NEGLIGIBLE',
+                                                'bg-slate-800 text-slate-500 border-slate-700': vuln.severity === 'UNKNOWN',
+                                                'bg-slate-700 text-slate-400 border-slate-600': !['CRITICAL','HIGH','MEDIUM','LOW','NEGLIGIBLE','UNKNOWN'].includes(vuln.severity)
+                                            }"
+                                            x-text="vuln.severity">
+                                        </span>
+                                        <span class="font-mono text-xs text-white font-bold shrink-0 w-36" x-text="vuln.cve_id"></span>
+                                        <span class="text-[10px] text-slate-500 shrink-0 w-20 font-mono"
+                                            x-text="vuln.cvss_score ? 'CVSS: ' + vuln.cvss_score : ''"></span>
+                                        <span class="text-[9px] font-black uppercase px-2 py-0.5 rounded-full shrink-0 border"
+                                            :class="{
+                                                'bg-red-500/10 text-red-400 border-red-500/20': vuln.status === 'OPEN',
+                                                'bg-green-500/10 text-green-400 border-green-500/20': vuln.status === 'FIXED',
+                                                'bg-yellow-500/10 text-yellow-400 border-yellow-500/20': vuln.status === 'MITIGATED',
+                                                'bg-slate-700 text-slate-400 border-slate-600': !['OPEN','FIXED','MITIGATED'].includes(vuln.status)
+                                            }"
+                                            x-text="vuln.status">
+                                        </span>
+                                        <span class="text-[10px] text-slate-400 truncate flex-1" x-text="vuln.description || 'Sem descrição'" :title="vuln.description"></span>
+                                        <i class="fas fa-arrow-up-right-from-square text-[9px] text-slate-600 group-hover/vuln:text-blue-400 transition shrink-0"></i>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                    </div>
+                </template>
+
+                <!-- Vazio -->
+                <div x-show="depsModal.paginated.length === 0"
+                     class="flex flex-col items-center justify-center py-16 text-slate-500">
+                    <i class="fas fa-box-open text-2xl mb-4 text-slate-700"></i>
+                    <span class="text-sm italic">Nenhum componente encontrado.</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer com paginação -->
+        <div class="flex items-center justify-between px-8 py-4 border-t border-slate-800 bg-slate-900/80 shrink-0">
+            <span class="text-[10px] text-slate-500 font-mono uppercase">
+                Exibindo <span class="text-white" x-text="Math.min((depsModal.page - 1) * depsModal.pageSize + 1, depsModal.total)"></span>–<span class="text-white" x-text="Math.min(depsModal.page * depsModal.pageSize, depsModal.total)"></span> de <span class="text-white" x-text="depsModal.total"></span> componentes
+            </span>
+            <div class="flex items-center gap-2">
+                <button 
+                    @click="depsModal.page = 1"
+                    :disabled="depsModal.page <= 1"
+                    class="px-3 py-1.5 text-[10px] font-black uppercase bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                    <i class="fas fa-angles-left"></i>
+                </button>
+                <button 
+                    @click="depsModal.page = Math.max(1, depsModal.page - 1)"
+                    :disabled="depsModal.page <= 1"
+                    class="px-3 py-1.5 text-[10px] font-black uppercase bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                    <i class="fas fa-chevron-left"></i> Anterior
+                </button>
+                <button 
+                    @click="depsModal.page = Math.min(depsModal.totalPages, depsModal.page + 1)"
+                    :disabled="depsModal.page >= depsModal.totalPages"
+                    class="px-3 py-1.5 text-[10px] font-black uppercase bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                    Próximo <i class="fas fa-chevron-right"></i>
+                </button>
+                <button 
+                    @click="depsModal.page = depsModal.totalPages"
+                    :disabled="depsModal.page >= depsModal.totalPages"
+                    class="px-3 py-1.5 text-[10px] font-black uppercase bg-slate-800 border border-slate-700 rounded-lg hover:border-blue-500 hover:text-white transition disabled:opacity-30 disabled:cursor-not-allowed">
+                    <i class="fas fa-angles-right"></i>
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Modal de Detalhe da Vulnerabilidade -->
+<div x-show="vulnDetail" x-cloak class="fixed inset-0 z-[130] flex items-center justify-center p-6">
+    <div @click="vulnDetail = null" class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm"></div>
+
+    <div x-show="vulnDetail" x-transition.scale.95
+         class="relative w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl overflow-hidden">
+
+        <!-- Header com severidade -->
+        <div class="flex items-start justify-between px-8 py-6 border-b border-slate-800"
+             :class="{
+                 'bg-red-500/5': vulnDetail?.severity === 'CRITICAL',
+                 'bg-orange-500/5': vulnDetail?.severity === 'HIGH',
+                 'bg-yellow-500/5': vulnDetail?.severity === 'MEDIUM',
+                 'bg-blue-500/5': vulnDetail?.severity === 'LOW',
+                 'bg-slate-800/30': !['CRITICAL','HIGH','MEDIUM','LOW'].includes(vulnDetail?.severity)
+             }">
+            <div class="flex items-center gap-4">
+                <span class="px-3 py-1.5 rounded-xl text-xs font-black uppercase border"
+                    :class="{
+                        'bg-red-500/20 text-red-400 border-red-500/40': vulnDetail?.severity === 'CRITICAL',
+                        'bg-orange-500/20 text-orange-400 border-orange-500/40': vulnDetail?.severity === 'HIGH',
+                        'bg-yellow-500/20 text-yellow-400 border-yellow-500/40': vulnDetail?.severity === 'MEDIUM',
+                        'bg-blue-500/20 text-blue-400 border-blue-500/40': vulnDetail?.severity === 'LOW',
+                        'bg-slate-700 text-slate-400 border-slate-600': !['CRITICAL','HIGH','MEDIUM','LOW'].includes(vulnDetail?.severity)
+                    }"
+                    x-text="vulnDetail?.severity">
+                </span>
+                <div>
+                    <h3 class="text-xl font-black text-white font-mono" x-text="vulnDetail?.cve_id"></h3>
+                    <p class="text-[10px] text-slate-500 uppercase tracking-widest mt-1 font-mono">Detalhes da Vulnerabilidade</p>
+                </div>
+            </div>
+            <button @click="vulnDetail = null" class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all shrink-0">
+                <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+            </button>
+        </div>
+
+        <!-- Corpo -->
+        <div class="px-8 py-6 space-y-5 overflow-y-auto" style="max-height: calc(90vh - 120px);">
+
+            <!-- Métricas em linha -->
+            <div class="grid grid-cols-3 gap-4">
+                <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                    <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-2">Score CVSS</p>
+                    <p class="text-2xl font-black font-mono"
+                       :class="vulnDetail?.cvss_score >= 9 ? 'text-red-400' : vulnDetail?.cvss_score >= 7 ? 'text-orange-400' : vulnDetail?.cvss_score >= 4 ? 'text-yellow-400' : 'text-white'"
+                       x-text="vulnDetail?.cvss_score ?? '—'"></p>
+                </div>
+                <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                    <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-2">Status</p>
+                    <span class="text-sm font-black uppercase px-3 py-1 rounded-full border"
+                        :class="{
+                            'bg-red-500/10 text-red-400 border-red-500/20': vulnDetail?.status === 'OPEN',
+                            'bg-green-500/10 text-green-400 border-green-500/20': vulnDetail?.status === 'FIXED',
+                            'bg-yellow-500/10 text-yellow-400 border-yellow-500/20': vulnDetail?.status === 'MITIGATED',
+                            'bg-slate-700 text-slate-400 border-slate-600': !['OPEN','FIXED','MITIGATED'].includes(vulnDetail?.status)
+                        }"
+                        x-text="vulnDetail?.status">
+                    </span>
+                </div>
+                <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                    <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-2">Cadeia Afetada</p>
+                    <p class="text-2xl font-black"
+                       :class="(vulnDetail?.transitive_impact || []).length > 0 ? 'text-orange-400' : 'text-slate-500'"
+                       x-text="vulnDetail?._loading ? '...' : (vulnDetail?.transitive_impact || []).length + ' relações'"></p>
+                </div>
+            </div>
+
+            <!-- Dependência exata vulnerável -->
+            <div x-show="!vulnDetail?._loading && vulnDetail?.component"
+                 class="bg-red-500/5 rounded-2xl p-4 border border-red-500/20">
+                <p class="text-[9px] text-red-400 uppercase tracking-widest font-black mb-2">
+                    <i class="fas fa-bullseye mr-1"></i> Dependência Vulnerável
+                </p>
+                <div class="flex items-center gap-3">
+                    <i class="fas fa-cube text-red-400 text-sm"></i>
+                    <span class="font-mono text-white font-bold" x-text="vulnDetail?.component"></span>
+                    <span class="font-mono text-[10px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded-lg" x-text="vulnDetail?.component_version"></span>
+                    <span class="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20 ml-auto">
+                        vulnerável diretamente
+                    </span>
+                </div>
+            </div>
+
+            <!-- Raio de impacto da correção -->
+            <div x-show="!vulnDetail?._loading && (vulnDetail?.transitive_impact || []).length > 0"
+                 class="bg-orange-500/5 rounded-2xl p-4 border border-orange-500/20">
+                <p class="text-[9px] text-orange-400 uppercase tracking-widest font-black mb-1">
+                    <i class="fas fa-radiation mr-1"></i> Cadeia de Dependências Afetada
+                </p>
+                <p class="text-[10px] text-slate-400 mb-3">
+                    Pacotes que dependem (direta ou transitivamente) de componentes com esta CVE
+                </p>
+                <div class="flex flex-col gap-1.5 max-h-48 overflow-y-auto">
+                    <template x-for="item in (vulnDetail?.transitive_impact || [])" :key="item.dependent + item.dep_version + item.vulnerable">
+                        <div class="flex items-center gap-2 px-3 py-2 bg-slate-800/60 rounded-xl border border-slate-700">
+                            <!-- Dependente -->
+                            <i class="fas fa-cube text-slate-500 text-[10px] shrink-0"></i>
+                            <span class="font-mono text-[11px] text-white font-bold shrink-0" x-text="item.dependent"></span>
+                            <span class="font-mono text-[9px] text-slate-500 bg-slate-700 px-1.5 py-0.5 rounded shrink-0" x-text="item.dep_version"></span>
+                            <!-- Seta -->
+                            <i class="fas fa-arrow-right text-orange-400 text-[10px] shrink-0 mx-1"></i>
+                            <!-- Vulnerável -->
+                            <i class="fas fa-bug text-red-400 text-[10px] shrink-0"></i>
+                            <span class="font-mono text-[11px] text-red-400 font-bold shrink-0" x-text="item.vulnerable"></span>
+                            <span class="font-mono text-[9px] text-slate-600 bg-slate-800 px-1.5 py-0.5 rounded shrink-0" x-text="item.vuln_version"></span>
+                        </div>
+                    </template>
+                </div>
+            </div>
+
+            <!-- Descrição completa -->
+            <div class="bg-slate-800/30 rounded-2xl p-5 border border-slate-700">
+                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">
+                    <i class="fas fa-align-left mr-1 text-blue-500"></i> Descrição
+                </p>
+                <div x-show="vulnDetail?._loading" class="flex items-center gap-3 text-slate-500">
+                    <i class="fas fa-spinner fa-spin text-blue-500"></i>
+                    <span class="text-sm animate-pulse">Buscando detalhes...</span>
+                </div>
+                <p x-show="!vulnDetail?._loading"
+                   class="text-sm text-slate-300 leading-relaxed"
+                   x-text="vulnDetail?.description || 'Sem descrição disponível.'"></p>
+            </div>
+
+            <!-- Link NVD -->
+            <div class="flex justify-end">
+                <a :href="`https://nvd.nist.gov/vuln/detail/${vulnDetail?.cve_id}`"
+                   target="_blank"
+                   class="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-blue-400 hover:text-blue-300 transition">
+                    <i class="fas fa-external-link-alt"></i>
+                    Ver no NVD
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.23.0/cytoscape.min.js"></script>
+
+<style>
+.graph-filter-btn { color: #94a3b8; transition: all 0.15s; }
+.graph-filter-btn.active { background: #334155; color: #fff; opacity: 1 !important; }
+.graph-filter-btn:not(.active) { opacity: 0.45; }
+</style>
+<script>
+let cyInstance = null;
+let currentProductId = null;
+let activeSeverity = 'CRITICAL'; // padrão ao abrir
+
+function setSeverityFilter(sev) {
+    activeSeverity = sev;
+    // Atualiza visual dos botões
+    document.querySelectorAll('.graph-filter-btn').forEach(b => b.classList.remove('active'));
+    const activeId = sev ? 'filter-' + sev : 'filter-all';
+    const btn = document.getElementById(activeId);
+    if (btn) btn.classList.add('active');
+    // Limpa input de CVE
+    const cveInput = document.getElementById('cve-search-input');
+    if (cveInput) cveInput.value = '';
+    // Recarrega grafo imediatamente
+    const severities = sev ? [sev] : [];
+    fetchGraph(currentProductId, severities, '');
+}
+
+function searchByCve() {
+    const val = document.getElementById('cve-search-input').value.trim().toUpperCase();
+    if (!val) return;
+    // Desativa botões de severidade
+    document.querySelectorAll('.graph-filter-btn').forEach(b => b.classList.remove('active'));
+    fetchGraph(currentProductId, [], val);
+}
+
+function loadGraph(productId) {
+    const modal = document.getElementById('graph-modal');
+    modal.classList.remove('hidden');
+    document.body.style.overflow = 'hidden';
+    document.getElementById('modal-product-name').innerText = 'Carregando...';
+
+    currentProductId = productId;
+    // Padrão: só CRITICAL para carregar rápido
+    activeSeverity = 'CRITICAL';
+    document.querySelectorAll('.graph-filter-btn').forEach(b => b.classList.remove('active'));
+    const btn = document.getElementById('filter-CRITICAL');
+    if (btn) btn.classList.add('active');
+    fetchGraph(productId, ['CRITICAL'], '');
+}
+
+function fetchGraph(productId, severities, cve) {
+    const nameLabel = document.getElementById('modal-product-name');
+    const loading   = document.getElementById('graph-loading');
+    const counter   = document.getElementById('graph-node-count');
+
+    loading.classList.remove('hidden');
+    counter.innerText = '';
+
+    let url = `/sbom/api/graph/${productId}/`;
+    const params = new URLSearchParams();
+    // Múltiplas severidades: ?severity=CRITICAL&severity=HIGH
+    if (severities && severities.length > 0) {
+        severities.forEach(s => params.append('severity', s));
+    }
+    if (cve) params.set('cve', cve);
+    if ([...params].length) url += '?' + params.toString();
+
+    if (cyInstance) { cyInstance.destroy(); cyInstance = null; }
+
+    fetch(url)
+        .then(res => res.json())
+        .then(data => {
+            loading.classList.add('hidden');
+            if (!data.nodes || data.nodes.length === 0) {
+                nameLabel.innerText = "Nenhum resultado para este filtro.";
+                counter.innerText = '';
+                return;
+            }
+            const vulnCount = data.nodes.filter(n => n.data.type === 'cve').length;
+            const compCount = data.nodes.filter(n => n.data.type === 'component').length;
+            counter.innerText = `${compCount} componentes · ${vulnCount} CVEs`;
+            
+            cyInstance = cytoscape({
+                container: document.getElementById('cy-fullscreen'),
+                elements: data, // Certifique-se que o Django envia {nodes: [], edges: []}
+                style: [
+                    {
+                        selector: 'node[label]', // Proteção contra o erro de mapping
+                        style: {
+                            'label': 'data(label)',
+                            'color': '#94a3b8',
+                            'font-size': '11px',
+                            'text-valign': 'bottom',
+                            'text-margin-y': '8px',
+                            'background-color': '#475569',
+                            'text-wrap': 'wrap', // Mudado de ellipsis para wrap para melhor leitura
+                            'text-max-width': '100px'
+                        }
+                    },
+                    {
+                        selector: 'node[type="product"]',
+                        style: { 
+                            'background-color': '#3b82f6', 
+                            'width': 60, 'height': 60,
+                            'border-width': 4, 'border-color': '#fff', 'border-opacity': 0.5
+                        }
+                    },
+                    {
+                        selector: 'node[type="component"]',
+                        style: { 'background-color': '#a855f7', 'width': 25, 'height': 25 }
+                    },
+                    {
+                        selector: 'node[type="cve"]',
+                        style: { 'background-color': '#ef4444', 'width': 14, 'height': 14, 'font-size': '8px' }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="CRITICAL"]',
+                        style: { 'background-color': '#dc2626', 'border-width': 2, 'border-color': '#fca5a5', 'width': 20, 'height': 20 }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="HIGH"]',
+                        style: { 'background-color': '#f97316', 'width': 17, 'height': 17 }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="MEDIUM"]',
+                        style: { 'background-color': '#eab308', 'width': 14, 'height': 14 }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="LOW"]',
+                        style: { 'background-color': '#3b82f6', 'width': 11, 'height': 11 }
+                    },
+                    {
+                        selector: 'edge',
+                        style: {
+                            'width': 2,
+                            'line-color': '#475569',
+                            'curve-style': 'bezier',
+                            'target-arrow-shape': 'triangle',
+                            'target-arrow-color': '#475569',
+                            'opacity': 0.6
+                        }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="NEGLIGIBLE"]',
+                        style: { 'background-color': '#475569', 'width': 9, 'height': 9 }
+                    },
+                    {
+                        selector: 'node[type="cve"][severity="UNKNOWN"]',
+                        style: { 'background-color': '#334155', 'width': 9, 'height': 9, 'border-width': 1, 'border-color': '#64748b' }
+                    },
+                    {
+                        selector: 'edge[label="HAS_VULNERABILITY"]',
+                        style: { 'line-color': 'rgba(239,68,68,0.3)', 'target-arrow-color': 'rgba(239,68,68,0.3)', 'width': 1, 'opacity': 0.5 }
+                    }
+                ],
+                layout: { 
+                    name: 'cose', 
+                    animate: true,
+                    randomize: true, // Importante para evitar sobreposição inicial
+                    padding: 50,
+                    nodeRepulsion: 400000,
+                    idealEdgeLength: 100,
+                    edgeElasticity: 100,
+                    componentSpacing: 100
+                }
+            });
+
+            // Clique em nó CVE → abre modal de detalhe
+            cyInstance.on('tap', 'node[type="cve"]', function(evt) {
+                const node = evt.target;
+                const cveId = node.data('label');
+                const severity = node.data('severity');
+
+                const appEl = document.querySelector('[x-data]');
+                const alpine = appEl._x_dataStack?.[0];
+                if (!alpine) return;
+
+                // Abre modal imediatamente com dados básicos
+                alpine.vulnDetail = {
+                    cve_id: cveId,
+                    severity: severity,
+                    description: null,
+                    cvss_score: null,
+                    status: '—',
+                    component: null,
+                    component_version: null,
+                    transitive_impact: [],
+                    _loading: true,
+                };
+
+                // Busca detalhes completos + impacto transitivo
+                fetch(`/sbom/api/cve/${cveId}/`)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (alpine.vulnDetail?.cve_id === cveId) {
+                            alpine.vulnDetail = {
+                                cve_id: data.cve_id || cveId,
+                                severity: data.severity || severity,
+                                description: data.description || 'Sem descrição disponível.',
+                                cvss_score: data.cvss_score || null,
+                                status: data.status || '—',
+                                component: data.component || null,
+                                component_version: data.component_version || null,
+                                transitive_impact: data.transitive_impact || [],
+                                _loading: false,
+                            };
+                        }
+                    })
+                    .catch(() => {
+                        if (alpine.vulnDetail?.cve_id === cveId) {
+                            alpine.vulnDetail = {
+                                cve_id: cveId,
+                                severity: severity,
+                                description: 'Erro ao carregar detalhes.',
+                                cvss_score: null,
+                                status: '—',
+                                component: null,
+                                component_version: null,
+                                transitive_impact: [],
+                                _loading: false,
+                            };
+                        }
+                    });
+            });
+
+            // Cursor pointer ao passar em nós CVE
+            cyInstance.on('mouseover', 'node[type="cve"]', () => {
+                document.getElementById('cy').style.cursor = 'pointer';
+            });
+            cyInstance.on('mouseout', 'node[type="cve"]', () => {
+                document.getElementById('cy').style.cursor = 'default';
+            });
+        })
+        .catch(err => {
+            console.error("Erro ao carregar grafo:", err);
+            nameLabel.innerText = "Erro na requisição.";
+        });
+}
+
+function closeGraph() {
+    const modal = document.getElementById('graph-modal');
+    modal.classList.add('hidden');
+    document.body.style.overflow = 'auto'; // Devolve o scroll
+    if (cyInstance) {
+        // Performance: Ao usar cyInstance.destroy(), você garante que o navegador não fique lento depois de abrir vários grafos.
+        cyInstance.destroy(); // Limpa a memória
+    }
+}
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MODAL HBOM — Gerenciar Componentes de Hardware
+═══════════════════════════════════════════════════════════ -->
+<div x-show="hbomModal.open" x-cloak class="fixed inset-0 z-[120] flex items-center justify-center p-4 md:p-8">
+    <div @click="hbomModal.open = false; hbomModal.resetForm(); hbomModal.selectedComponent = null" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md"></div>
+
+    <div x-show="hbomModal.open" x-transition.scale.95
+         class="relative w-full max-w-6xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl flex flex-col overflow-hidden"
+         style="max-height: 90vh;">
+
+        <!-- Header -->
+        <div class="flex items-center justify-between px-8 py-5 border-b border-slate-800 bg-slate-900/80 shrink-0">
+            <div>
+                <h3 class="text-xl font-bold text-white flex items-center">
+                    <i class="fas fa-microchip mr-3 text-cyan-500"></i>
+                    HBOM:
+                    <span class="ml-2 text-cyan-400" x-text="hbomModal.productName"></span>
+                </h3>
+                <p class="text-[10px] text-slate-500 uppercase tracking-widest mt-1 font-mono">
+                    <span x-text="hbomModal.components.length"></span> componentes cadastrados
+                </p>
+            </div>
+            <div class="flex items-center gap-3">
+                <button @click="hbomModal.selectedComponent = null; hbomModal.resetForm(); hbomModal.showForm = true"
+                        x-show="!hbomModal.showForm"
+                        class="flex items-center gap-2 px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 rounded-2xl text-white text-[11px] font-black uppercase tracking-wider transition">
+                    <i class="fas fa-plus"></i> Novo Componente
+                </button>
+                <button @click="hbomModal.open = false; hbomModal.resetForm(); hbomModal.selectedComponent = null"
+                        class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all">
+                    <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+                </button>
+            </div>
+        </div>
+
+        <!-- Layout split: lista + detalhe -->
+        <div class="flex flex-1 overflow-hidden">
+
+            <!-- COLUNA ESQUERDA: Lista de componentes -->
+            <div class="w-72 shrink-0 border-r border-slate-800 flex flex-col overflow-hidden">
+                <div class="overflow-y-auto flex-1">
+                    <!-- Loading -->
+                    <div x-show="hbomModal.loading" class="flex flex-col items-center justify-center py-16 text-slate-500">
+                        <i class="fas fa-gear fa-spin text-2xl text-cyan-500 mb-3"></i>
+                        <span class="text-xs font-mono animate-pulse">Carregando...</span>
+                    </div>
+                    <!-- Vazio -->
+                    <div x-show="!hbomModal.loading && hbomModal.components.length === 0 && !hbomModal.showForm"
+                         class="flex flex-col items-center justify-center py-16 text-slate-500 px-6 text-center">
+                        <i class="fas fa-microchip text-3xl mb-3 text-slate-700"></i>
+                        <p class="text-xs font-bold mb-1">Nenhum componente</p>
+                        <p class="text-[10px] text-slate-600">Clique em "Novo Componente"</p>
+                    </div>
+                    <!-- Lista resumida -->
+                    <div x-show="!hbomModal.loading && hbomModal.components.length > 0">
+                        <template x-for="comp in hbomModal.components" :key="comp.id">
+                            <div @click="hbomModal.selectedComponent = comp; hbomModal.showForm = false"
+                                 class="px-4 py-4 border-b border-slate-800 cursor-pointer transition"
+                                 :class="hbomModal.selectedComponent?.id === comp.id
+                                     ? 'bg-cyan-500/10 border-l-2 border-l-cyan-500'
+                                     : 'hover:bg-slate-800/50'">
+                                <div class="flex items-center justify-between gap-2">
+                                    <div class="flex-1 min-w-0">
+                                        <p class="text-white font-bold text-sm truncate" x-text="comp.name"></p>
+                                        <p class="text-[10px] text-slate-500 truncate" x-text="comp.manufacturer"></p>
+                                        <div class="flex items-center gap-2 mt-1.5 flex-wrap">
+                                            <span class="text-[9px] font-black uppercase px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20" x-text="comp.type"></span>
+                                            <!-- Indicador de ameaças -->
+                                            <span x-show="comp.threats && comp.threats.length > 0"
+                                                  class="text-[9px] font-black px-2 py-0.5 rounded-full bg-orange-500/10 text-orange-400 border border-orange-500/20">
+                                                <i class="fas fa-triangle-exclamation mr-0.5"></i>
+                                                <span x-text="comp.threats.length"></span>
+                                            </span>
+                                            <!-- Indicador sem proteções -->
+                                            <span x-show="!comp.secure_boot && !comp.firmware_signed && !comp.encrypted_storage && !comp.debug_ports_disabled"
+                                                  class="text-[9px] px-1.5 py-0.5 rounded-full bg-red-500/10 text-red-400 border border-red-500/20">
+                                                <i class="fas fa-shield-halved"></i>
+                                            </span>
+                                        </div>
+                                    </div>
+                                    <i class="fas fa-chevron-right text-slate-600 text-[10px] shrink-0"
+                                       :class="hbomModal.selectedComponent?.id === comp.id ? 'text-cyan-500' : ''"></i>
+                                </div>
+                            </div>
+                        </template>
+                    </div>
+                </div>
+            </div>
+
+            <!-- COLUNA DIREITA: Detalhe do componente ou formulário -->
+            <div class="flex-1 overflow-y-auto">
+
+            <!-- Formulário de Adição/Edição -->
+            <div x-show="hbomModal.showForm" class="px-8 py-6">
+                <p class="text-[10px] text-cyan-500 uppercase tracking-widest font-black mb-5">
+                    <i class="fas fa-pen mr-1"></i>
+                    <span x-text="hbomModal.editingId ? 'Editar Componente' : 'Novo Componente de Hardware'"></span>
+                </p>
+                <div class="grid grid-cols-2 gap-4">
+                    <!-- Nome -->
+                    <div>
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-1">Nome / Modelo *</label>
+                        <input x-model="hbomModal.form.name" type="text" placeholder="ex: BCM2837, ESP32..."
+                               class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition">
+                    </div>
+                    <!-- Fabricante -->
+                    <div>
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-1">Fabricante *</label>
+                        <input x-model="hbomModal.form.manufacturer" type="text" placeholder="ex: Broadcom, Espressif..."
+                               class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition">
+                    </div>
+                    <!-- Tipo -->
+                    <div>
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-1">Tipo *</label>
+                        <select x-model="hbomModal.form.type"
+                                class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-cyan-500 transition">
+                            <template x-for="[val, label] in hbomModal.componentTypes" :key="val">
+                                <option :value="val" x-text="label"></option>
+                            </template>
+                        </select>
+                    </div>
+                    <!-- Versão -->
+                    <div>
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-1">Versão / Especificação</label>
+                        <input x-model="hbomModal.form.version" type="text" placeholder="ex: Bluetooth 5.2, 802.11ac..."
+                               class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition">
+                    </div>
+
+                    <!-- Interfaces expostas -->
+                    <div class="col-span-2">
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-2">Interfaces Expostas</label>
+                        <div class="flex flex-wrap gap-2">
+                            <template x-for="[val, label] in hbomModal.interfaceChoices" :key="val">
+                                <button type="button"
+                                        @click="hbomModal.toggleInterface(val)"
+                                        class="px-3 py-1.5 rounded-xl text-[10px] font-black uppercase border transition"
+                                        :class="hbomModal.form.interfaces.includes(val)
+                                            ? 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40'
+                                            : 'bg-slate-800 text-slate-500 border-slate-700 hover:border-slate-500'">
+                                    <span x-text="val"></span>
+                                </button>
+                            </template>
+                        </div>
+                    </div>
+
+                    <!-- Propriedades de segurança -->
+                    <div class="col-span-2">
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-2">Propriedades de Segurança</label>
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <label class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 cursor-pointer hover:border-green-500/40 transition"
+                                   :class="hbomModal.form.secure_boot ? 'border-green-500/40 bg-green-500/5' : ''">
+                                <input type="checkbox" x-model="hbomModal.form.secure_boot" class="accent-green-500">
+                                <span class="text-[11px] text-slate-300 font-bold">Secure Boot</span>
+                            </label>
+                            <label class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 cursor-pointer hover:border-green-500/40 transition"
+                                   :class="hbomModal.form.firmware_signed ? 'border-green-500/40 bg-green-500/5' : ''">
+                                <input type="checkbox" x-model="hbomModal.form.firmware_signed" class="accent-green-500">
+                                <span class="text-[11px] text-slate-300 font-bold">Firmware Assinado</span>
+                            </label>
+                            <label class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 cursor-pointer hover:border-green-500/40 transition"
+                                   :class="hbomModal.form.encrypted_storage ? 'border-green-500/40 bg-green-500/5' : ''">
+                                <input type="checkbox" x-model="hbomModal.form.encrypted_storage" class="accent-green-500">
+                                <span class="text-[11px] text-slate-300 font-bold">Storage Cifrado</span>
+                            </label>
+                            <label class="flex items-center gap-3 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 cursor-pointer hover:border-green-500/40 transition"
+                                   :class="hbomModal.form.debug_ports_disabled ? 'border-green-500/40 bg-green-500/5' : ''">
+                                <input type="checkbox" x-model="hbomModal.form.debug_ports_disabled" class="accent-green-500">
+                                <span class="text-[11px] text-slate-300 font-bold">Debug Desabilitado</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <!-- Notas -->
+                    <div class="col-span-2">
+                        <label class="text-[10px] text-slate-500 uppercase tracking-widest font-black block mb-1">Notas</label>
+                        <textarea x-model="hbomModal.form.notes" rows="2" placeholder="Observações adicionais..."
+                                  class="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-2.5 text-sm text-white placeholder-slate-600 focus:outline-none focus:border-cyan-500 transition resize-none"></textarea>
+                    </div>
+                </div>
+
+                <!-- Botões do form -->
+                <div class="flex items-center gap-3 mt-5 pt-5 border-t border-slate-800">
+                    <button @click="saveHbomComponent()"
+                            :disabled="hbomModal.saving || !hbomModal.form.name || !hbomModal.form.manufacturer"
+                            class="flex items-center gap-2 px-6 py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-2xl text-white text-[11px] font-black uppercase tracking-wider transition">
+                        <i class="fas fa-save"></i>
+                        <span x-text="hbomModal.saving ? 'Salvando...' : (hbomModal.editingId ? 'Salvar Alterações' : 'Adicionar Componente')"></span>
+                    </button>
+                    <button @click="hbomModal.resetForm()"
+                            class="flex items-center gap-2 px-5 py-2.5 bg-slate-800 hover:bg-slate-700 rounded-2xl text-slate-400 hover:text-white text-[11px] font-black uppercase tracking-wider transition border border-slate-700">
+                        <i class="fas fa-arrow-left text-xs"></i> Voltar
+                    </button>
+                </div>
+            </div>
+
+            <!-- Painel vazio — nenhum componente selecionado -->
+            <div x-show="!hbomModal.showForm && !hbomModal.selectedComponent"
+                 class="flex flex-col items-center justify-center h-full py-20 text-slate-600">
+                <i class="fas fa-hand-pointer text-4xl mb-4 text-slate-700"></i>
+                <p class="text-sm font-bold">Selecione um componente</p>
+                <p class="text-[10px] mt-1">ou crie um novo</p>
+            </div>
+
+            <!-- Painel de detalhe do componente selecionado -->
+            <div x-show="!hbomModal.showForm && hbomModal.selectedComponent" class="px-8 py-6">
+                <template x-if="hbomModal.selectedComponent">
+                    <div>
+                        <!-- Cabeçalho do detalhe -->
+                        <div class="flex items-start justify-between gap-4 mb-6">
+                            <div>
+                                <h4 class="text-2xl font-black text-white" x-text="hbomModal.selectedComponent.name"></h4>
+                                <p class="text-slate-400 text-sm mt-0.5" x-text="hbomModal.selectedComponent.manufacturer"></p>
+                                <div class="flex items-center gap-2 mt-2 flex-wrap">
+                                    <span class="text-[10px] font-black uppercase px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20" x-text="hbomModal.selectedComponent.type"></span>
+                                    <span x-show="hbomModal.selectedComponent.version" class="font-mono text-[10px] text-slate-500 bg-slate-800 px-2 py-0.5 rounded-lg" x-text="hbomModal.selectedComponent.version"></span>
+                                </div>
+                            </div>
+                            <div class="flex flex-col gap-2 shrink-0 min-w-[140px]">
+                                <!-- Ação primária: Ameaças -->
+                                <button @click="openThreatModal(hbomModal.selectedComponent)"
+                                        class="flex items-center justify-center gap-2 px-4 py-2.5 bg-orange-500 hover:bg-orange-400 rounded-xl text-white text-[11px] font-black uppercase tracking-wide transition w-full">
+                                    <i class="fas fa-shield-halved"></i> Mapear Ameaças
+                                </button>
+                                <!-- Ações secundárias -->
+                                <button @click="editHbomComponent(hbomModal.selectedComponent)"
+                                        class="flex items-center justify-center gap-2 px-4 py-2 bg-slate-700 hover:bg-cyan-600 rounded-xl text-slate-300 hover:text-white text-[11px] font-black uppercase tracking-wide transition w-full">
+                                    <i class="fas fa-pen text-xs"></i> Editar
+                                </button>
+                                <button @click="if(confirm('Remover ' + hbomModal.selectedComponent.name + '?')) { deleteHbomComponent(hbomModal.selectedComponent.id); hbomModal.selectedComponent = null; }"
+                                        class="flex items-center justify-center gap-2 px-4 py-2 bg-slate-800 hover:bg-red-600/20 border border-slate-700 hover:border-red-500/40 rounded-xl text-slate-500 hover:text-red-400 text-[11px] font-black uppercase tracking-wide transition w-full">
+                                    <i class="fas fa-trash text-xs"></i> Remover
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Métricas rápidas -->
+                        <div class="grid grid-cols-3 gap-3 mb-6">
+                            <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-1">Interfaces</p>
+                                <p class="text-2xl font-black text-white" x-text="(hbomModal.selectedComponent.interfaces || []).length"></p>
+                            </div>
+                            <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-1">Ameaças</p>
+                                <p class="text-2xl font-black"
+                                   :class="(hbomModal.selectedComponent.threats || []).length > 0 ? 'text-orange-400' : 'text-white'"
+                                   x-text="(hbomModal.selectedComponent.threats || []).length"></p>
+                            </div>
+                            <div class="bg-slate-800/50 rounded-2xl p-4 border border-slate-700">
+                                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-1">Mitigações Pendentes</p>
+                                <p class="text-2xl font-black"
+                                   :class="hbomModal.pendingMitigations > 0 ? 'text-red-400' : 'text-green-400'"
+                                   x-text="hbomModal.pendingMitigations"></p>
+                            </div>
+                        </div>
+
+                        <!-- Interfaces -->
+                        <div x-show="(hbomModal.selectedComponent.interfaces || []).length > 0" class="mb-5">
+                            <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-2">Interfaces Expostas</p>
+                            <div class="flex flex-wrap gap-2">
+                                <template x-for="iface in hbomModal.selectedComponent.interfaces" :key="iface">
+                                    <span class="text-[10px] font-black uppercase px-3 py-1.5 rounded-xl bg-slate-800 text-slate-300 border border-slate-600" x-text="iface"></span>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Propriedades de segurança -->
+                        <div class="mb-5">
+                            <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-2">Propriedades de Segurança</p>
+                            <div class="grid grid-cols-2 gap-2">
+                                <div class="flex items-center gap-2 px-3 py-2 rounded-xl border"
+                                     :class="hbomModal.selectedComponent.secure_boot ? 'bg-green-500/5 border-green-500/20' : 'bg-slate-800/30 border-slate-700'">
+                                    <i class="fas fa-lock text-xs" :class="hbomModal.selectedComponent.secure_boot ? 'text-green-400' : 'text-slate-600'"></i>
+                                    <span class="text-[11px] font-bold" :class="hbomModal.selectedComponent.secure_boot ? 'text-green-400' : 'text-slate-600'">Secure Boot</span>
+                                    <span class="ml-auto text-[9px] font-black" :class="hbomModal.selectedComponent.secure_boot ? 'text-green-400' : 'text-slate-600'" x-text="hbomModal.selectedComponent.secure_boot ? '✓' : '✗'"></span>
+                                </div>
+                                <div class="flex items-center gap-2 px-3 py-2 rounded-xl border"
+                                     :class="hbomModal.selectedComponent.firmware_signed ? 'bg-green-500/5 border-green-500/20' : 'bg-slate-800/30 border-slate-700'">
+                                    <i class="fas fa-certificate text-xs" :class="hbomModal.selectedComponent.firmware_signed ? 'text-green-400' : 'text-slate-600'"></i>
+                                    <span class="text-[11px] font-bold" :class="hbomModal.selectedComponent.firmware_signed ? 'text-green-400' : 'text-slate-600'">Firmware Assinado</span>
+                                    <span class="ml-auto text-[9px] font-black" :class="hbomModal.selectedComponent.firmware_signed ? 'text-green-400' : 'text-slate-600'" x-text="hbomModal.selectedComponent.firmware_signed ? '✓' : '✗'"></span>
+                                </div>
+                                <div class="flex items-center gap-2 px-3 py-2 rounded-xl border"
+                                     :class="hbomModal.selectedComponent.encrypted_storage ? 'bg-green-500/5 border-green-500/20' : 'bg-slate-800/30 border-slate-700'">
+                                    <i class="fas fa-shield text-xs" :class="hbomModal.selectedComponent.encrypted_storage ? 'text-green-400' : 'text-slate-600'"></i>
+                                    <span class="text-[11px] font-bold" :class="hbomModal.selectedComponent.encrypted_storage ? 'text-green-400' : 'text-slate-600'">Storage Cifrado</span>
+                                    <span class="ml-auto text-[9px] font-black" :class="hbomModal.selectedComponent.encrypted_storage ? 'text-green-400' : 'text-slate-600'" x-text="hbomModal.selectedComponent.encrypted_storage ? '✓' : '✗'"></span>
+                                </div>
+                                <div class="flex items-center gap-2 px-3 py-2 rounded-xl border"
+                                     :class="hbomModal.selectedComponent.debug_ports_disabled ? 'bg-green-500/5 border-green-500/20' : 'bg-slate-800/30 border-slate-700'">
+                                    <i class="fas fa-ban text-xs" :class="hbomModal.selectedComponent.debug_ports_disabled ? 'text-green-400' : 'text-slate-600'"></i>
+                                    <span class="text-[11px] font-bold" :class="hbomModal.selectedComponent.debug_ports_disabled ? 'text-green-400' : 'text-slate-600'">Debug Desabilitado</span>
+                                    <span class="ml-auto text-[9px] font-black" :class="hbomModal.selectedComponent.debug_ports_disabled ? 'text-green-400' : 'text-slate-600'" x-text="hbomModal.selectedComponent.debug_ports_disabled ? '✓' : '✗'"></span>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Ameaças e Mitigações -->
+                        <div x-show="(hbomModal.selectedComponent.threats || []).length > 0">
+                            <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">Ameaças EMB3D e Mitigações</p>
+                            <div class="flex flex-col gap-3">
+                                <template x-for="threat in hbomModal.selectedComponent.threats" :key="threat.id">
+                                    <div class="bg-slate-800/40 rounded-2xl border border-slate-700 overflow-hidden">
+                                        <!-- Header da threat -->
+                                        <div class="flex items-center justify-between px-4 py-3 bg-orange-500/5 border-b border-slate-700">
+                                            <div>
+                                                <span class="font-mono text-[10px] text-orange-400 font-black" x-text="threat.threat_id"></span>
+                                                <span class="text-[11px] text-white font-bold ml-2" x-text="threat.threat_name"></span>
+                                            </div>
+                                            <button @click="removeComponentThreat(threat.id, hbomModal.selectedComponent.id); hbomModal.selectedComponent = hbomModal.components.find(c => c.id === hbomModal.selectedComponent.id)"
+                                                    class="text-slate-600 hover:text-red-400 transition p-1">
+                                                <i class="fas fa-times text-[10px]"></i>
+                                            </button>
+                                        </div>
+                                        <!-- Mitigações da threat -->
+                                        <div class="px-4 py-3 flex flex-col gap-2">
+                                            <template x-for="mit in threat.mitigations" :key="mit.id">
+                                                <div class="flex items-center gap-3">
+                                                    <!-- Status -->
+                                                    <select @change="updateMitigationStatus(mit.id, $event.target.value)"
+                                                            :value="mit.status"
+                                                            class="text-[9px] font-black uppercase rounded-lg px-2 py-1.5 border focus:outline-none bg-slate-900 shrink-0 transition"
+                                                            :class="{
+                                                                'text-red-400 border-red-500/30': mit.status === 'PENDING',
+                                                                'text-green-400 border-green-500/30': mit.status === 'RESOLVED',
+                                                                'text-yellow-400 border-yellow-500/30': mit.status === 'ACCEPTED'
+                                                            }">
+                                                        <option value="PENDING">Pendente</option>
+                                                        <option value="RESOLVED">Corrigida</option>
+                                                        <option value="ACCEPTED">Risco Aceito</option>
+                                                    </select>
+                                                    <!-- MID clicável -->
+                                                    <button @click="openMitigationDetail(mit)"
+                                                            class="font-mono text-[9px] text-orange-400 hover:text-orange-300 font-black transition flex items-center gap-1 shrink-0">
+                                                        <span x-text="mit.mitigation_id"></span>
+                                                        <i class="fas fa-arrow-up-right-from-square text-[8px]"></i>
+                                                    </button>
+                                                    <!-- Nome -->
+                                                    <span class="text-[11px] text-slate-300 truncate" x-text="mit.mitigation_name"></span>
+                                                </div>
+                                            </template>
+                                        </div>
+                                    </div>
+                                </template>
+                            </div>
+                        </div>
+
+                        <!-- Notas -->
+                        <p x-show="hbomModal.selectedComponent.notes" class="text-[10px] text-slate-500 mt-4 italic" x-text="hbomModal.selectedComponent.notes"></p>
+                    </div>
+                </template>
+            </div>
+
+            </div><!-- fim coluna direita -->
+        </div><!-- fim layout split -->
+    </div>
+</div>
+
+</script>
+
+<!-- ═══════════════════════════════════════════════════════════
+     MODAL EMB3D — Associar Ameaças ao Componente
+═══════════════════════════════════════════════════════════ -->
+<div x-show="threatModal.open" x-cloak class="fixed inset-0 z-[130] flex items-center justify-center p-4 md:p-8">
+    <div @click="threatModal.open = false" class="absolute inset-0 bg-slate-950/90 backdrop-blur-md"></div>
+
+    <div x-show="threatModal.open" x-transition.scale.95
+         class="relative w-full max-w-4xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl flex flex-col overflow-hidden"
+         style="max-height: 90vh;">
+
+        <!-- Header -->
+        <div class="flex items-center justify-between px-8 py-5 border-b border-slate-800 shrink-0">
+            <div>
+                <h3 class="text-lg font-bold text-white flex items-center">
+                    <i class="fas fa-shield-halved mr-3 text-orange-500"></i>
+                    Ameaças EMB3D:
+                    <span class="ml-2 text-orange-400" x-text="threatModal.componentName"></span>
+                </h3>
+                <!-- Steps -->
+                <div class="flex items-center gap-2 mt-2">
+                    <span class="text-[9px] font-black uppercase px-2 py-0.5 rounded-full transition"
+                          :class="threatModal.step === 'pids' ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' : 'text-slate-600'">
+                        1. Selecionar Propriedades
+                    </span>
+                    <i class="fas fa-chevron-right text-slate-700 text-[8px]"></i>
+                    <span class="text-[9px] font-black uppercase px-2 py-0.5 rounded-full transition"
+                          :class="threatModal.step === 'threats' ? 'bg-orange-500/20 text-orange-400 border border-orange-500/30' : 'text-slate-600'">
+                        2. Confirmar Ameaças
+                    </span>
+                </div>
+            </div>
+            <button @click="threatModal.open = false"
+                    class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all">
+                <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+            </button>
+        </div>
+
+        <div class="overflow-y-auto flex-1 px-8 py-6">
+
+            <!-- ETAPA 1: Seleção de PIDs -->
+            <div x-show="threatModal.step === 'pids'">
+                <p class="text-[10px] text-slate-500 mb-5">
+                    Selecione as propriedades que se aplicam ao componente <strong class="text-white" x-text="threatModal.componentName"></strong>. O sistema irá sugerir as ameaças EMB3D correspondentes.
+                </p>
+
+                <template x-for="[category, props] in Object.entries(threatModal.categories)" :key="category">
+                    <div class="mb-6">
+                        <p class="text-[10px] text-orange-400 uppercase tracking-widest font-black mb-3 flex items-center gap-2">
+                            <i class="fas fa-layer-group text-[8px]"></i>
+                            <span x-text="category"></span>
+                        </p>
+                        <div class="flex flex-col gap-2">
+                            <template x-for="prop in props" :key="prop.pid">
+                                <div>
+                                    <!-- PID principal -->
+                                    <label class="flex items-start gap-3 bg-slate-800/50 hover:bg-slate-800 border rounded-xl px-4 py-3 cursor-pointer transition"
+                                           :class="threatModal.selectedPids.includes(prop.pid) ? 'border-orange-500/40 bg-orange-500/5' : 'border-slate-700'">
+                                        <input type="checkbox"
+                                               :checked="threatModal.selectedPids.includes(prop.pid)"
+                                               @change="togglePid(prop.pid)"
+                                               class="accent-orange-500 mt-0.5 shrink-0">
+                                        <div>
+                                            <span class="font-mono text-[10px] text-orange-400 font-black" x-text="prop.pid"></span>
+                                            <span class="text-[11px] text-white ml-2" x-text="prop.name"></span>
+                                            <span x-show="prop.threats && prop.threats.length > 0"
+                                                  class="ml-2 text-[9px] text-slate-500">
+                                                (<span x-text="prop.threats ? prop.threats.length : 0"></span> ameaças)
+                                            </span>
+                                        </div>
+                                    </label>
+                                    <!-- Sub-propriedades -->
+                                    <template x-if="prop.children && prop.children.length > 0 && threatModal.selectedPids.includes(prop.pid)">
+                                        <div class="ml-8 mt-1 flex flex-col gap-1">
+                                            <template x-for="child in prop.children" :key="child.pid">
+                                                <label class="flex items-start gap-3 bg-slate-800/30 hover:bg-slate-800 border rounded-xl px-4 py-2.5 cursor-pointer transition"
+                                                       :class="threatModal.selectedPids.includes(child.pid) ? 'border-orange-500/30 bg-orange-500/5' : 'border-slate-800'">
+                                                    <input type="checkbox"
+                                                           :checked="threatModal.selectedPids.includes(child.pid)"
+                                                           @change="togglePid(child.pid)"
+                                                           class="accent-orange-500 mt-0.5 shrink-0">
+                                                    <div>
+                                                        <span class="font-mono text-[9px] text-orange-300 font-black" x-text="child.pid"></span>
+                                                        <span class="text-[11px] text-slate-300 ml-2" x-text="child.name"></span>
+                                                    </div>
+                                                </label>
+                                            </template>
+                                        </div>
+                                    </template>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </template>
+            </div>
+
+            <!-- ETAPA 2: Confirmar Threats -->
+            <div x-show="threatModal.step === 'threats'">
+                <div x-show="threatModal.loadingThreats" class="flex items-center justify-center py-12">
+                    <i class="fas fa-gear fa-spin text-orange-500 text-2xl mr-3"></i>
+                    <span class="text-slate-400 text-sm">Buscando ameaças...</span>
+                </div>
+
+                <div x-show="!threatModal.loadingThreats">
+                    <p class="text-[10px] text-slate-500 mb-4">
+                        <span x-text="threatModal.suggestedThreats.length"></span> ameaças identificadas com base nas propriedades selecionadas. Desmarque as que não se aplicam.
+                    </p>
+
+                    <div x-show="threatModal.suggestedThreats.length === 0" class="text-center py-10 text-slate-500">
+                        <i class="fas fa-check-circle text-3xl text-green-500 mb-3 block"></i>
+                        Nenhuma ameaça identificada para as propriedades selecionadas.
+                    </div>
+
+                    <div class="flex flex-col gap-3">
+                        <template x-for="threat in threatModal.suggestedThreats" :key="threat.tid">
+                            <label class="flex items-start gap-3 border rounded-2xl px-5 py-4 cursor-pointer transition"
+                                   :class="threatModal.selectedThreats.includes(threat.tid)
+                                       ? 'border-orange-500/40 bg-orange-500/5'
+                                       : 'border-slate-700 bg-slate-800/30 opacity-50'">
+                                <input type="checkbox"
+                                       :checked="threatModal.selectedThreats.includes(threat.tid)"
+                                       @change="
+                                           const idx = threatModal.selectedThreats.indexOf(threat.tid);
+                                           if (idx >= 0) threatModal.selectedThreats.splice(idx, 1);
+                                           else threatModal.selectedThreats.push(threat.tid);
+                                       "
+                                       class="accent-orange-500 mt-1 shrink-0">
+                                <div class="flex-1">
+                                    <div class="flex items-center gap-3 flex-wrap">
+                                        <span class="font-mono text-[10px] text-orange-400 font-black" x-text="threat.tid"></span>
+                                        <span class="text-sm text-white font-bold" x-text="threat.name"></span>
+                                        <span class="text-[9px] uppercase px-2 py-0.5 rounded-full bg-slate-700 text-slate-400 font-black" x-text="threat.category"></span>
+                                    </div>
+                                    <p class="text-[10px] text-slate-400 mt-1 line-clamp-2" x-text="threat.description"></p>
+                                    <p class="text-[9px] text-slate-600 mt-1">
+                                        <span x-text="threat.mitigations ? threat.mitigations.length : 0"></span> mitigações disponíveis
+                                    </p>
+                                </div>
+                            </label>
+                        </template>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Footer com botões de navegação -->
+        <div class="flex items-center justify-between px-8 py-4 border-t border-slate-800 shrink-0">
+            <button x-show="threatModal.step === 'threats'"
+                    @click="threatModal.step = 'pids'"
+                    class="flex items-center gap-2 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-xl text-slate-400 text-[11px] font-black uppercase transition">
+                <i class="fas fa-chevron-left text-[10px]"></i> Voltar
+            </button>
+            <div x-show="threatModal.step === 'pids'" class="text-[10px] text-slate-500 font-mono">
+                <span x-text="threatModal.selectedPids.length"></span> propriedade(s) selecionada(s)
+            </div>
+
+            <!-- Etapa 1: Avançar para threats -->
+            <button x-show="threatModal.step === 'pids'"
+                    @click="fetchThreatsForPids()"
+                    :disabled="!threatModal.selectedPids.length"
+                    class="flex items-center gap-2 px-5 py-2.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl text-white text-[11px] font-black uppercase transition">
+                Ver Ameaças <i class="fas fa-chevron-right text-[10px]"></i>
+            </button>
+
+            <!-- Etapa 2: Salvar -->
+            <button x-show="threatModal.step === 'threats' && !threatModal.loadingThreats"
+                    @click="saveThreats()"
+                    :disabled="threatModal.saving || !threatModal.selectedThreats.length"
+                    class="flex items-center gap-2 px-5 py-2.5 bg-orange-600 hover:bg-orange-500 disabled:opacity-40 disabled:cursor-not-allowed rounded-xl text-white text-[11px] font-black uppercase transition">
+                <i class="fas fa-save"></i>
+                <span x-text="threatModal.saving ? 'Salvando...' : `Associar ${threatModal.selectedThreats.length} ameaça(s)`"></span>
+            </button>
+        </div>
+    </div>
+</div>
+
+</script>
+
+<!-- Modal Detalhe Mitigação EMB3D -->
+<div x-show="mitigationDetail" x-cloak class="fixed inset-0 z-[140] flex items-center justify-center p-6">
+    <div @click="mitigationDetail = null" class="absolute inset-0 bg-slate-950/80 backdrop-blur-sm"></div>
+
+    <div x-show="mitigationDetail" x-transition.scale.95
+         class="relative w-full max-w-2xl bg-slate-900 border border-slate-700 rounded-[2.5rem] shadow-2xl overflow-hidden"
+         style="max-height: 85vh;">
+
+        <!-- Header -->
+        <div class="flex items-start justify-between px-8 py-6 border-b border-slate-800 bg-orange-500/5">
+            <div class="flex items-center gap-4">
+                <div class="w-12 h-12 rounded-2xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center shrink-0">
+                    <i class="fas fa-shield-halved text-orange-400 text-lg"></i>
+                </div>
+                <div>
+                    <p class="font-mono text-[10px] text-orange-400 font-black uppercase tracking-widest" x-text="mitigationDetail?.mitigation_id"></p>
+                    <h3 class="text-lg font-bold text-white mt-0.5" x-text="mitigationDetail?.mitigation_name"></h3>
+                </div>
+            </div>
+            <button @click="mitigationDetail = null"
+                    class="group bg-slate-800 hover:bg-red-500/20 p-3 rounded-2xl border border-slate-700 transition-all shrink-0">
+                <i class="fas fa-times text-slate-400 group-hover:text-red-500"></i>
+            </button>
+        </div>
+
+        <!-- Corpo -->
+        <div class="overflow-y-auto px-8 py-6 space-y-5" style="max-height: calc(85vh - 110px);">
+
+            <!-- Status atual -->
+            <div class="flex items-center gap-3">
+                <span class="text-[9px] text-slate-500 uppercase tracking-widest font-black">Status atual:</span>
+                <span class="text-[10px] font-black uppercase px-3 py-1 rounded-full border"
+                      :class="{
+                          'bg-red-500/10 text-red-400 border-red-500/20': mitigationDetail?.status === 'PENDING',
+                          'bg-green-500/10 text-green-400 border-green-500/20': mitigationDetail?.status === 'RESOLVED',
+                          'bg-yellow-500/10 text-yellow-400 border-yellow-500/20': mitigationDetail?.status === 'ACCEPTED'
+                      }"
+                      x-text="mitigationDetail?.status === 'PENDING' ? 'Pendente' : mitigationDetail?.status === 'RESOLVED' ? 'Corrigida' : 'Risco Aceito'">
+                </span>
+            </div>
+
+            <!-- Loading -->
+            <div x-show="mitigationDetail?.loading" class="flex items-center gap-3 py-6 text-slate-500">
+                <i class="fas fa-gear fa-spin text-orange-500"></i>
+                <span class="text-sm animate-pulse">Carregando detalhes do EMB3D...</span>
+            </div>
+
+            <!-- Descrição completa -->
+            <div x-show="!mitigationDetail?.loading" class="bg-slate-800/40 rounded-2xl p-5 border border-slate-700">
+                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">
+                    <i class="fas fa-align-left mr-1 text-orange-500"></i> Descrição
+                </p>
+                <p class="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap" x-text="mitigationDetail?.description || 'Sem descrição disponível.'"></p>
+            </div>
+
+            <!-- IEC 62443 -->
+            <div x-show="!mitigationDetail?.loading && mitigationDetail?.iec_62443"
+                 class="bg-slate-800/40 rounded-2xl p-5 border border-slate-700">
+                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">
+                    <i class="fas fa-certificate mr-1 text-blue-500"></i> IEC 62443 Mappings
+                </p>
+                <p class="text-[11px] text-slate-400 leading-relaxed whitespace-pre-wrap font-mono" x-text="mitigationDetail?.iec_62443"></p>
+            </div>
+
+            <!-- Referências -->
+            <div x-show="!mitigationDetail?.loading && mitigationDetail?.references"
+                 class="bg-slate-800/40 rounded-2xl p-5 border border-slate-700">
+                <p class="text-[9px] text-slate-500 uppercase tracking-widest font-black mb-3">
+                    <i class="fas fa-book mr-1 text-purple-500"></i> Referências
+                </p>
+                <p class="text-[11px] text-slate-400 leading-relaxed whitespace-pre-wrap" x-text="mitigationDetail?.references"></p>
+            </div>
+
+            <!-- Link EMB3D -->
+            <div x-show="!mitigationDetail?.loading" class="flex justify-end">
+                <a :href="`https://emb3d.mitre.org/mitigations/${mitigationDetail?.mitigation_id}.html`"
+                   target="_blank"
+                   class="flex items-center gap-2 text-[10px] font-black uppercase tracking-widest text-orange-400 hover:text-orange-300 transition">
+                    <i class="fas fa-external-link-alt"></i>
+                    Ver no EMB3D
+                </a>
+            </div>
+        </div>
+    </div>
+</div>
+
+</script>
 </body>
 </html>
